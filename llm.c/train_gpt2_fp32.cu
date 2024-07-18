@@ -36,8 +36,8 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 // ----------------------------------------------------------------------------
 // CUDA utils
 
-// convenience macro for calculating grid/block dimensions for kernels
-#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
+// // convenience macro for calculating grid/block dimensions for kernels
+// #define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
 // CUDA error checking
 void cudaCheck(cudaError_t error, const char *file, int line)
@@ -842,9 +842,9 @@ void attention_forward(float *out, float *qkvr, float *att,
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
     float *q, *k, *v;
+    v = qkvr + 2 * B * T * C;
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
-    v = qkvr + 2 * B * T * C;
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
@@ -874,49 +874,50 @@ void attention_forward(float *out, float *qkvr, float *att,
     cudaCheck(cudaGetLastError());
 }
 
-__global__ void repeat_interleave_forward_kernel(float *dst, const float *src, int B, int NH, int T, int HS, int num_kv_heads)
+__global__ void repeat_interleave_forward_kernel(float *dst, const float *src, int B, int num_kv_heads, int T, int HS, int queries_per_kv)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_threads = B * NH * T * HS;
+    int total_threads = B * num_kv_heads * queries_per_kv * T * HS;
 
     if (idx < total_threads)
     {
-        int b = idx / (NH * T * HS);
-        int rest = idx % (NH * T * HS);
+        int b = idx / (num_kv_heads * queries_per_kv * T * HS);
+        int rest = idx % (num_kv_heads * queries_per_kv * T * HS);
         int nh = rest / (T * HS);
         rest = rest % (T * HS);
         int t = rest / HS;
         int hs = rest % HS;
 
-        // Calculate source head index, alternating between the original heads
-        int src_nh = (nh / 2) + (nh % 2) * (num_kv_heads / 2);
+        // Map destination head index to source head index
+        int src_nh = nh % num_kv_heads;
         int src_idx = (b * num_kv_heads * T * HS) + (src_nh * T * HS) + (t * HS) + hs;
-        dst[idx] = src[src_idx];
+        int dst_idx = idx;
+        dst[dst_idx] = src[src_idx];
     }
 }
 
 __global__ void repeat_interleave_backward_kernel(float *dsrc, const float *ddst, int B, int num_kv_heads, int T, int HS, int queries_per_kv)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_threads = B * num_kv_heads * T * HS;
+    int total_threads = B * num_kv_heads * queries_per_kv * T * HS;
 
     if (idx < total_threads)
     {
-        int b = idx / (num_kv_heads * T * HS);
-        int rest = idx % (num_kv_heads * T * HS);
+        int b = idx / (num_kv_heads * queries_per_kv * T * HS);
+        int rest = idx % (num_kv_heads * queries_per_kv * T * HS);
         int nh = rest / (T * HS);
         rest = rest % (T * HS);
         int t = rest / HS;
         int hs = rest % HS;
 
-        int src_nh = (nh / 2) + (nh % 2) * (num_kv_heads / 2);
-        int src_idx = (b * queries_per_kv * num_kv_heads * T * HS) + (src_nh * T * HS) + (t * HS) + hs;
+        int src_nh = nh % num_kv_heads;
+        int src_idx = (b * num_kv_heads * T * HS) + (src_nh * T * HS) + (t * HS) + hs;
         atomicAdd(&dsrc[src_idx], ddst[idx]);
     }
 }
 
 void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
-                           int B, int T, int C, int NH, int num_kv_heads, cublasHandle_t cublas_handle)
+                           int B, int T, int C, int NH, int num_kv_heads)
 {
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -935,6 +936,9 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
     q = qkvr + 0 * B * T * C;
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
+    // size_t ksize = sizeof(k) / sizeof(k[0]);
+    // size_t vsize = sizeof(v) / sizeof(v[0]);
+    // printf("ksize-Vsize: %ld, %ld\n%d, %d, %d\n", ksize, vsize, HS, kv_HS, queries_per_kv);
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
@@ -944,35 +948,45 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
     if (num_kv_heads != NH)
     {
         float *new_k, *new_v;
-        cudaMalloc((void **)&new_k, B * num_kv_heads * T * kv_HS * sizeof(float));
-        cudaMalloc((void **)&new_v, B * num_kv_heads * T * kv_HS * sizeof(float));
+        cudaMalloc((void **)&new_k, B * NH * T * HS * sizeof(float));
+        cudaMalloc((void **)&new_v, B * NH * T * HS * sizeof(float));
 
-        repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_k, k, B, num_kv_heads, T, kv_HS, queries_per_kv);
-        repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_v, v, B, num_kv_heads, T, kv_HS, queries_per_kv);
+        int repeat_interleave_threads = B * num_kv_heads * queries_per_kv * T * HS;
+        repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_k, k, B, num_kv_heads, T, HS, queries_per_kv);
+        repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_v, v, B, num_kv_heads, T, HS, queries_per_kv);
         cudaCheck(cudaGetLastError());
 
-        cudaFree(k);
-        cudaFree(v);
-        k = new_k;
-        v = new_v;
+        // Copy the contents of new_k and new_v back to k and v
+        cudaMemcpy(k, new_k, B * NH * T * HS * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(v, new_v, B * NH * T * HS * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        cudaFree(new_k);
+        cudaFree(new_v);
     }
+
+    // size_t k1size = sizeof(k) / sizeof(k[0]);
+    // size_t v1size = sizeof(v) / sizeof(v[0]);
+    // printf("%ld, %ld", k1size, v1size);
 
     // Batched matrix multiply with cuBLAS for QK^T
     const float alpha = 1.0f;
     const float beta = 0.0f;
     float *preatt = inp;
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, kv_HS, &alpha, k, kv_HS, T * kv_HS, q, HS, T * HS, &beta, preatt, T, T * T, B * num_kv_heads));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
+    // size_t sizepatt = sizeof(preatt) / sizeof(preatt[0]);
+    // printf("Preatt: %ld", sizepatt);
 
     // Multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+
     cudaCheck(cudaGetLastError());
 
     // New approach: first cuBLAS another batched matmul
     float *vaccum = inp;
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, kv_HS, T, T, &alpha, v, kv_HS, T * kv_HS, att, T, T * T, &beta, vaccum, kv_HS, T * kv_HS, B * num_kv_heads));
+    cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
 
     // Now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -988,6 +1002,7 @@ void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *da
 {
     const int block_size = 256;
     int HS = C / NH; // head size
+    int queries_per_kv = NH / num_kv_heads;
     const float one = 1.0f;
     const float zero = 0.0f; // note beta = 1.0f so that we accumulate gradients (+=)
     // unpack convenience pointers into q, k, v
@@ -1023,27 +1038,53 @@ void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *da
     // backward into k
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
 
-    // Allocate intermediate tensors for backward repeat interleave
-    float *dsrc_k, *dsrc_v;
-    cudaMalloc((void **)&dsrc_k, B * num_kv_heads * T * HS * sizeof(float));
-    cudaMalloc((void **)&dsrc_v, B * num_kv_heads * T * HS * sizeof(float));
-    cudaMemset(dsrc_k, 0, B * num_kv_heads * T * HS * sizeof(float));
-    cudaMemset(dsrc_v, 0, B * num_kv_heads * T * HS * sizeof(float));
+    // // Allocate intermediate tensors for backward repeat interleave
+    // float *dsrc_k, *dsrc_v;
+    // cudaMalloc((void **)&dsrc_k, B * num_kv_heads * *T * HS * sizeof(float));
+    // cudaMalloc((void **)&dsrc_v, B * num_kv_heads * T * HS * sizeof(float));
+    // cudaMemset(dsrc_k, 0, B * num_kv_heads * T * HS * sizeof(float));
+    // cudaMemset(dsrc_v, 0, B * num_kv_heads * T * HS * sizeof(float));
 
-    // backward through repeat interleave operation for dk and dv
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_k, dk, B, NH, T, HS, num_kv_heads);
-    repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_v, dv, B, NH, T, HS, num_kv_heads);
-    cudaCheck(cudaGetLastError());
+    // // backward through repeat interleave operation for dk and dv
+    // num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
+    // repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_k, dk, B, NH, T, HS, num_kv_heads);
+    // repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_v, dv, B, NH, T, HS, num_kv_heads);
+    // cudaCheck(cudaGetLastError());
 
-    // backward into inp
-    num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dsrc_k, dsrc_v, B, T, NH, HS);
-    cudaCheck(cudaGetLastError());
+    // Repeat interleave for GQA if num_kv_heads != NH
+    if (num_kv_heads != NH)
+    {
+        // Allocate intermediate tensors for backward repeat interleave
+        float *dsrc_k, *dsrc_v;
+        cudaMalloc((void **)&dsrc_k, B * num_kv_heads * queries_per_kv * T * HS * sizeof(float));
+        cudaMalloc((void **)&dsrc_v, B * num_kv_heads * queries_per_kv * T * HS * sizeof(float));
+        cudaMemset(dsrc_k, 0, B * num_kv_heads * queries_per_kv * T * HS * sizeof(float));
+        cudaMemset(dsrc_v, 0, B * num_kv_heads * queries_per_kv * T * HS * sizeof(float));
 
-    // Cleanup
-    cudaFree(dsrc_k);
-    cudaFree(dsrc_v);
+        // backward through repeat interleave operation for dk and dv
+        int repeat_interleave_threads = B * NH * T * HS;
+        num_blocks = CEIL_DIV(repeat_interleave_threads, block_size);
+        repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_k, dk, B, num_kv_heads, T, HS, queries_per_kv);
+        repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_v, dv, B, num_kv_heads, T, HS, queries_per_kv);
+        cudaCheck(cudaGetLastError());
+
+        // backward into inp
+        num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
+        permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dsrc_k, dsrc_v, B, T, NH, HS);
+        cudaCheck(cudaGetLastError());
+
+        // Cleanup
+        cudaFree(dsrc_k);
+        cudaFree(dsrc_v);
+    }
+    else
+    {
+        // backward into inp
+        // backward into inp without repeat interleave
+        num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
+        permute_kernel_backward<<<num_blocks, block_size>>>(dinp, dq, dk, dv, B, T, NH, HS);
+        cudaCheck(cudaGetLastError());
+    }
 }
 
 void residual_forward(float *out, float *inp1, float *inp2, int N)
@@ -1577,7 +1618,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
-        attention_forward_gqa(l_atty, l_qkvr, l_att, scratch, B, T, C, NH);
+        attention_forward_gqa(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, 6);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B * T * C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1748,7 +1789,7 @@ void gpt2_backward(GPT2 *model)
         float *buffer_a = l_atty;
         float *buffer_b = l_fch; // this is B x T x 4C, so even larger than what we need
 
-        attention_backward_qka(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH);
+        attention_backward_gqa(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, 6);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
