@@ -78,3 +78,11 @@ run_in_parallel() {
 run_in_parallel 6 "${download_commands[@]}"
 
 echo "All files downloaded and saved in their respective directories"
+
+# Run the generate_checkpoint.py script
+python3 generate_checkpoint.py
+
+# Run the visualize_checkpoint.py script
+python3 visualize_checkpoint.py
+
+echo "Process completed successfully."

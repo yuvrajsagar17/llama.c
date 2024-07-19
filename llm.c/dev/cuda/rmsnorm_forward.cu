@@ -200,10 +200,8 @@ __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const floa
 //                                      const float *weight, const float *bias, int B, int T, int C)
 // {
 //     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
 //     int bt = idx / C;
 //     int c = idx % C;
-
 //     float m = mean[bt];
 //     float s = rstd[bt];
 //     float xi = inp[idx];
