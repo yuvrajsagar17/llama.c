@@ -94,6 +94,7 @@ __global__ void encoder_forward_kernel3(float4 *out,
         int t = bt % T;
         int c4 = idx % C4;
         int ix = inp[b * T + t];
+        // In CUDA, when dealing with vector types like float4, direct assignment is already supported. Therefore, the direct assignment out[b * T * C4 + t * C4 + c4] = wte[ix * C4 + c4]; should work correctly as long as `out` and `wte` are properly aligned float4 arrays.
         out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
     }
 }
@@ -1475,6 +1476,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
     {
+
         num_parameters += model->param_sizes[i];
     }
     model->num_parameters = num_parameters;
@@ -1483,7 +1485,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
-    printf("%ld", sizeof(num_parameters * sizeof(float))) float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
+    printf("%ld", sizeof(num_parameters * sizeof(float)));
+    float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
     cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     free(params_memory_cpu);

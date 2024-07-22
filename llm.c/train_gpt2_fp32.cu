@@ -81,7 +81,7 @@ __device__ inline float4 add_float4(const float4 &a, const float4 &b)
 // use of float4 leads to using 128-bit LDG / STG instructions in SASS,
 // very helpful in memory-bound kernels like encoder_forward
 __global__ void encoder_forward_kernel3(float4 *out,
-                                        const int *inp, const float4 *wte, const float4 *wpe,
+                                        const int *inp, const float4 *wte,
                                         int B, int T, int C)
 {
     int C4 = C / 4;
@@ -94,37 +94,136 @@ __global__ void encoder_forward_kernel3(float4 *out,
         int t = bt % T;
         int c4 = idx % C4;
         int ix = inp[b * T + t];
-        out[b * T * C4 + t * C4 + c4] = add_float4(wte[ix * C4 + c4], wpe[t * C4 + c4]);
+        out[b * T * C4 + t * C4 + c4] = wte[ix * C4 + c4]; // Removed wpe
     }
 }
 
-// really bad naive kernel with atomicAdd
-__global__ void encoder_backward_kernel(float *dwte, float *dwpe,
-                                        const float *dout, const int *inp,
-                                        int B, int T, int C)
+// uses float4 wte and dout
+__global__ void encoder_backward_kernel(float4 *dwte, const float4 *dout, const int *inp, int B, int T, int C)
 {
+    int C4 = C / 4;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = B * T * C;
-
+    int N = B * T * C4;
     if (idx < N)
     {
-        int bt = idx / C;
+        int bt = idx / C4;
         int b = bt / T;
         int t = bt % T;
-        int c = idx % C;
-
+        int c4 = idx % C4;
         int ix = inp[b * T + t];
 
-        const float *dout_btc = dout + b * T * C + t * C + c;
-        float *dwte_ix = dwte + ix * C + c;
-        float *dwpe_tc = dwpe + t * C + c;
-
-        atomicAdd(dwte_ix, *dout_btc);
-        atomicAdd(dwpe_tc, *dout_btc);
+        // Using atomicAdd to avoid race conditions while updating gradients
+        atomicAdd(&(dwte[ix * C4 + c4].x), dout[b * T * C4 + t * C4 + c4].x);
+        atomicAdd(&(dwte[ix * C4 + c4].y), dout[b * T * C4 + t * C4 + c4].y);
+        atomicAdd(&(dwte[ix * C4 + c4].z), dout[b * T * C4 + t * C4 + c4].z);
+        atomicAdd(&(dwte[ix * C4 + c4].w), dout[b * T * C4 + t * C4 + c4].w);
     }
 }
 
-/** RMS-Norm Kernel:
+/**
+ * A helper kernel using for RoPE
+ */
+__global__ void precompute_freqs_cis_kernel(float *freqs_cos, float *freqs_sin, int dim, int end, float theta)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid < dim / 2)
+    {
+        float freq = 1.0f / powf(theta, (float)tid * 2.0f / dim); // float powf(float base, float exponent);
+
+        for (int t = 0; t < end; t++)
+        {
+            freqs_cos[t * (dim / 2) + tid] = cosf(t * freq);
+            freqs_sin[t * (dim / 2) + tid] = sinf(t * freq);
+        }
+    }
+}
+
+__global__ void apply_rope_forward_kernel(
+    float *q, float *k, float *freqs_cos, float *freqs_sin,
+    int B, int T, int NH, int HS)
+{
+
+    int b = blockIdx.x;
+    int t = blockIdx.y;
+    int nh = blockIdx.z;
+    int hs = threadIdx.x;
+
+    int half_hs = HS / 2;
+
+    if (hs < half_hs)
+    {
+        int index = b * T * NH * HS + t * NH * HS + nh * HS + hs;
+        int freq_index = t * half_hs + hs;
+
+        float cos_val = freqs_cos[freq_index];
+        float sin_val = freqs_sin[freq_index];
+
+        float q_r = q[index];
+        float q_i = q[index + half_hs];
+        float k_r = k[index];
+        float k_i = k[index + half_hs];
+
+        q[index] = q_r * cos_val - q_i * sin_val;           // (ac-bd)
+        q[index + half_hs] = q_r * sin_val + q_i * cos_val; // (ad+bc) * i
+
+        k[index] = k_r * cos_val - k_i * sin_val;           // (ac-bd)
+        k[index + half_hs] = k_r * sin_val + k_i * cos_val; // (ad+bc) * i
+    }
+}
+
+__global__ void apply_rope_backward_kernel(
+    float *dq, float *dk, const float *q, const float *k,
+    const float *freqs_cos, const float *freqs_sin,
+    int B, int T, int NH, int HS)
+{
+    int b = blockIdx.x;
+    int t = blockIdx.y;
+    int nh = blockIdx.z;
+    int hs = threadIdx.x;
+
+    int half_hs = HS / 2;
+
+    if (hs < half_hs)
+    {
+        int index = b * T * NH * HS + t * NH * HS + nh * HS + hs;
+        int freq_index = t * half_hs + hs;
+
+        float cos_val = freqs_cos[freq_index];
+        float sin_val = freqs_sin[freq_index];
+
+        float q_r = q[index];
+        float q_i = q[index + half_hs];
+        float k_r = k[index];
+        float k_i = k[index + half_hs];
+
+        // Gradients with respect to q and k (already computed)
+        float dq_r = dq[index];
+        float dq_i = dq[index + half_hs];
+        float dk_r = dk[index];
+        float dk_i = dk[index + half_hs];
+
+        // Gradients with respect to q and k
+        dq[index] = dq_r * cos_val + dq_i * sin_val;
+        dq[index + half_hs] = dq_i * cos_val - dq_r * sin_val;
+        dk[index] = dk_r * cos_val + dk_i * sin_val;
+        dk[index + half_hs] = dk_i * cos_val - dk_r * sin_val;
+
+        /**
+         * WE DON'T NEED TO ACCUMULATE THE GRADIENTs IN d_freq_cos and d_freq_sin.
+         */
+        // // Gradients with respect to freqs_cos and freqs_sin
+        // float d_freq_cos_q = q_r * dq_r + q_i * dq_i;
+        // float d_freq_sin_q = -q_i * dq_r + q_r * dq_i;
+        // float d_freq_cos_k = k_r * dk_r + k_i * dk_i;
+        // float d_freq_sin_k = -k_i * dk_r + k_r * dk_i;
+
+        // atomicAdd(&d_freq_cos[freq_index], d_freq_cos_q + d_freq_cos_k);
+        // atomicAdd(&d_freq_sin[freq_index], d_freq_sin_q + d_freq_sin_k);
+    }
+}
+
+/**
+ * RMS-Norm Kernel:
  *
  */
 __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const float *weight, const float *bias, int N, int C)
@@ -852,26 +951,57 @@ __global__ void __launch_bounds__(16 * 16, 2) matmul_forward_kernel4(float *out,
 // kernel launchers
 
 void encoder_forward(float *out,
-                     const int *inp, const float *wte, const float *wpe,
+                     const int *inp, const float *wte,
                      int B, int T, int C)
 {
     assert(C % 4 == 0);
     const int block_size = 512;
     const int N = B * T * C;
-    const int grid_size = CEIL_DIV(N / 4, block_size);
-    encoder_forward_kernel3<<<grid_size, block_size>>>((float4 *)out, inp, (float4 *)wte, (float4 *)wpe, B, T, C);
+    const int grid_size = CEIL_DIV((N / 4), block_size);
+    encoder_forward_kernel3<<<grid_size, block_size>>>((float4 *)out, inp, (float4 *)wte, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
-void encoder_backward(float *dwte, float *dwpe,
+void encoder_backward(float *dwte,
                       const float *dout, const int *inp,
                       int B, int T, int C)
 {
+    assert(C % 4 == 0);
     const int N = B * T * C;
-    const int block_size = 256;
-    const int grid_size = CEIL_DIV(N, block_size);
-    encoder_backward_kernel<<<grid_size, block_size>>>(dwte, dwpe, dout, inp, B, T, C);
+    const int block_size = 512;
+    const int grid_size = CEIL_DIV((N / 4), block_size);
+    encoder_backward_kernel<<<grid_size, block_size>>>((float4 *)dwte, (float4 *)dout, inp, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+// A helper function to calculate `cis` components freqs_cos & freqs_sin
+
+void precompute_freqs_cis(float *freqs_cos, float *freqs_sin, int dim, int end, float theta)
+{
+    int threads = 64;
+    int blocks = (dim / 2 + threads - 1) / threads;
+    precompute_freqs_cis_kernel<<<blocks, threads>>>(freqs_cos, freqs_sin, dim, end, theta);
+    cudaDeviceSynchronize();
+}
+
+void apply_rope_forward(float *q, float *k, float *freqs_cos, float *freqs_sin, int B, int T, int NH, int HS)
+{
+    dim3 blocks(B, T, NH);
+    int threads = HS / 2;
+    apply_rope_forward_kernel<<<blocks, threads>>>(q, k, freqs_cos, freqs_sin, B, T, NH, HS);
+    cudaDeviceSynchronize();
+}
+
+void apply_rope_backward(
+    float *dq, float *dk, const float *q, const float *k,
+    const float *freqs_cos, const float *freqs_sin,
+    int B, int T, int NH, int HS)
+{
+    dim3 blocks(B, T, NH);
+    dim3 threads(HS / 2);
+    apply_rope_backward_kernel<<<blocks, threads>>>(
+        dq, dk, q, k, freqs_cos, freqs_sin, B, T, NH, HS);
+    cudaDeviceSynchronize();
 }
 
 void rmsnorm_forward(float *out, const float *inp, const float *weight, const float *bias, int B, int T, int C)
@@ -1011,6 +1141,7 @@ __global__ void repeat_interleave_backward_kernel(float *dsrc, const float *ddst
 }
 
 void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
+                           float *freq_cos, float *freq_sin,
                            int B, int T, int C, int NH, int num_kv_heads)
 {
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
@@ -1021,8 +1152,7 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int HS = C / NH;              // head size
-    int kv_HS = C / num_kv_heads; // key/value head size
+    int HS = C / NH; // head size
     int queries_per_kv = NH / num_kv_heads;
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
@@ -1035,8 +1165,13 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
     // printf("ksize-Vsize: %ld, %ld\n%d, %d, %d\n", ksize, vsize, HS, kv_HS, queries_per_kv);
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
+
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
+
+    apply_rope_forward(q, k, freq_cos, freq_sin, B, T, NH, (C / NH));
 
     // Repeat interleave for GQA
     if (num_kv_heads != NH)
@@ -1089,8 +1224,10 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
     cudaCheck(cudaGetLastError());
 }
 
-void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *datt, float *scratch,
+void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *datt,
+                            *scratch,
                             const float *dout,
+                            const float *freq_cos, const float *freq_sin,
                             const float *qkvr, const float *att,
                             int B, int T, int C, int NH, int num_kv_heads)
 {
@@ -1132,19 +1269,6 @@ void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *da
     // backward into k
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T, &one, q, HS, T * HS, dpreatt, T, T * T, &zero, dk, HS, T * HS, B * NH));
 
-    // // Allocate intermediate tensors for backward repeat interleave
-    // float *dsrc_k, *dsrc_v;
-    // cudaMalloc((void **)&dsrc_k, B * num_kv_heads * *T * HS * sizeof(float));
-    // cudaMalloc((void **)&dsrc_v, B * num_kv_heads * T * HS * sizeof(float));
-    // cudaMemset(dsrc_k, 0, B * num_kv_heads * T * HS * sizeof(float));
-    // cudaMemset(dsrc_v, 0, B * num_kv_heads * T * HS * sizeof(float));
-
-    // // backward through repeat interleave operation for dk and dv
-    // num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    // repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_k, dk, B, NH, T, HS, num_kv_heads);
-    // repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_v, dv, B, NH, T, HS, num_kv_heads);
-    // cudaCheck(cudaGetLastError());
-
     // Repeat interleave for GQA if num_kv_heads != NH
     if (num_kv_heads != NH)
     {
@@ -1161,6 +1285,9 @@ void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *da
         repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_k, dk, B, num_kv_heads, T, HS, queries_per_kv);
         repeat_interleave_backward_kernel<<<num_blocks, block_size>>>(dsrc_v, dv, B, num_kv_heads, T, HS, queries_per_kv);
         cudaCheck(cudaGetLastError());
+
+        // Apply RoPE backward
+        apply_rope_backward(dq, dsrc_k, q, k, freq_cos, freq_sin, B, T, NH, (C / NH)); // (C /NH) = (C /NH) is the head_dim (hs)
 
         // backward into inp
         num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
@@ -1358,20 +1485,20 @@ void fused_classifier3(float *logits, float *losses,
 
 typedef struct
 {
-    int max_seq_len;       // max sequence length, e.g. 1024
-    int vocab_size;        // vocab size, e.g. 50257
-    int padded_vocab_size; // padded to e.g. %128==0, 50304
-    int num_layers;        // number of layers, e.g. 12
-    int num_heads;         // number of heads in attention, e.g. 12
-    int channels;          // number of channels, e.g. 768
+    int max_seq_len = 1024;        // max sequence length, e.g. 1024
+    int vocab_size = 50257;        // vocab size, e.g. 50257
+    int num_layers = 12;           // number of layers, e.g. 12
+    int num_heads = 12;            // number of heads in attention, e.g. 12
+    int channels = 768;            // number of channels, e.g. 768
+    int padded_vocab_size = 50304; // padded to e.g. %128==0, 50304
 } GPT2Config;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 18
+#define NUM_PARAMETER_TENSORS 17
 typedef struct
 {
-    float *wte;      // (V, C)
-    float *wpe;      // (maxT, C)
+    float *wte; // (V, C)
+    // float *wpe;      // (maxT, C)  No need of Positional Information parameter here. Since we are using RoPE
     float *ln1w;     // (L, C)
     float *ln1b;     // (L, C)
     float *qkvw;     // (L, 3*C, C)
@@ -1396,24 +1523,24 @@ void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config)
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
-    param_sizes[0] = Vp * C;           // wte
-    param_sizes[1] = maxT * C;         // wpe
-    param_sizes[2] = L * C;            // ln1w
-    param_sizes[3] = L * C;            // ln1b
-    param_sizes[4] = L * (3 * C) * C;  // qkvw
-    param_sizes[5] = L * (3 * C);      // qkvb
-    param_sizes[6] = L * C * C;        // attprojw
-    param_sizes[7] = L * C;            // attprojb
-    param_sizes[8] = L * C;            // ln2w
-    param_sizes[9] = L * C;            // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C);     // fcb
-    param_sizes[12] = L * (4 * C) * C; // fcw_g
-    param_sizes[13] = L * (4 * C);     // fcb_g
-    param_sizes[14] = L * C * (4 * C); // fcprojw
-    param_sizes[15] = L * C;           // fcprojb
-    param_sizes[16] = C;               // lnfw
-    param_sizes[17] = C;               // lnfb
+    param_sizes[0] = Vp * C; // wte
+    // param_sizes[1] = maxT * C;         // wpe   No need. Using RoPE
+    param_sizes[1] = L * C;            // ln1w
+    param_sizes[2] = L * C;            // ln1b
+    param_sizes[3] = L * (3 * C) * C;  // qkvw
+    param_sizes[4] = L * (3 * C);      // qkvb
+    param_sizes[5] = L * C * C;        // attprojw
+    param_sizes[6] = L * C;            // attprojb
+    param_sizes[7] = L * C;            // ln2w
+    param_sizes[8] = L * C;            // ln2b
+    param_sizes[8] = L * (4 * C) * C;  // fcw
+    param_sizes[10] = L * (4 * C);     // fcb
+    param_sizes[11] = L * (4 * C) * C; // fcw_g
+    param_sizes[12] = L * (4 * C);     // fcb_g
+    param_sizes[13] = L * C * (4 * C); // fcprojw
+    param_sizes[14] = L * C;           // fcprojb
+    param_sizes[15] = C;               // lnfw
+    param_sizes[16] = C;               // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -1438,8 +1565,9 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
     }
     // assign all the tensors their place in the array
     // Added 2 new params for SwiGLU
+    // Removed wpe because of RoPE
     float **ptrs[] = {
-        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
+        &params->wte, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb, &params->fcw_g, &params->fcb_g,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb};
     float *params_memory_iterator = params_memory;
@@ -1451,11 +1579,14 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 16
+#define NUM_ACTIVATION_TENSORS 18
 typedef struct
 {
-    float *encoded; // (B, T, C)
-    float *ln1;     // (L, B, T, C)
+    float *encoded;  // (B, T, C)
+    float *freq_cos; // (T, (C/NH)/2)      # T * head_dim/2
+    float *freq_sin; // (T, (C/NH)/2)      # T * head_dim/2
+
+    float *ln1; // (L, B, T, C)
     // float *ln1_mean;   // (L, B, T)
     // float *ln1_rstd;   // (L, B, T)
     float *atty;      // (L, B, T, C)
@@ -1491,39 +1622,55 @@ void fill_in_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    act_sizes[0] = B * T * C;     // encoded
-    act_sizes[1] = L * B * T * C; // ln1
+    act_sizes[0] = B * T * C;          // encoded
+    act_sizes[1] = T * (C / (2 * NH)); // freq_cos  (seq_len * head_dim)
+    act_sizes[2] = T * (C / (2 * NH)); // freq_sin
+    act_sizes[3] = L * B * T * C;      // ln1
+
     // act_sizes[2] = L * B * T;                            // ln1_mean
     // act_sizes[3] = L * B * T;                            // ln1_rstd
-    act_sizes[2] = L * B * T * C;      // atty
-    act_sizes[3] = L * B * NH * T * T; // att
-    act_sizes[4] = L * B * T * C;      // attproj
-    act_sizes[5] = L * B * T * C;      // residual2
-    act_sizes[6] = L * B * T * C;      // ln2
+    act_sizes[4] = L * B * T * C;      // atty
+    act_sizes[5] = L * B * NH * T * T; // att
+    act_sizes[6] = L * B * T * C;      // attproj
+    act_sizes[7] = L * B * T * C;      // residual2
+    act_sizes[8] = L * B * T * C;      // ln2
     // act_sizes[9] = L * B * T;                            // ln2_mean
     // act_sizes[10] = L * B * T;                           // ln2_rstd
-    act_sizes[7] = L * B * T * 4 * C; // fch
-    act_sizes[8] = L * B * T * 4 * C; // fch_glu
-    act_sizes[9] = L * B * T * 4 * C; // fch_swiglu
-    act_sizes[10] = L * B * T * C;    // fcproj
-    act_sizes[11] = L * B * T * C;    // residual3
-    act_sizes[12] = B * T * C;        // lnf
+    act_sizes[9] = L * B * T * 4 * C;  // fch
+    act_sizes[10] = L * B * T * 4 * C; // fch_glu
+    act_sizes[11] = L * B * T * 4 * C; // fch_swiglu
+    act_sizes[12] = L * B * T * C;     // fcproj
+    act_sizes[13] = L * B * T * C;     // residual3
+    act_sizes[14] = B * T * C;         // lnf
     // act_sizes[17] = B * T;                               // lnf_mean
     // act_sizes[18] = B * T;                               // lnf_rstd
-    act_sizes[13] = B * T;                               // losses
-    act_sizes[24] = L * B * T * 3 * C;                   // qkvr
-    act_sizes[15] = B * T * max(3 * C, max(NH * T, Vp)); // output / scratch
+    act_sizes[15] = B * T;                               // losses
+    act_sizes[16] = L * B * T * 3 * C;                   // qkvr
+    act_sizes[17] = B * T * max(3 * C, max(NH * T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 3
+#define NUM_BACKWARD_TENSORS 5
 typedef struct
 {
     float *bt4c;      // (B, T, 4*C)
     float *preatt;    // (B, NH, T, T)
     float *residual3; // (B, T, C)
+    /**
+     * NO NEED of accumulating these gradients.
+     *
+     *  // float *d_freq_cos; // (T, (C/NH)/2) T * (C / (2 * NH))
+        // float *d_freq_sin; // (T, (C/NH)/2)
+
+     *
+
+    act_sizes[3] = T * (C / (2 * NH)); // d_freq_cos grads accumulation (Needed because we have to traverse from attention to precompute kernel)
+    act_sizes[4] = T * (C / (2 * NH)); // d_freq_sin
+     *
+    */
+
 } GradActTensors;
 
 void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T, GPT2Config config)
@@ -1556,7 +1703,7 @@ float *malloc_and_point(float **targets[], const size_t *act_sizes, int n)
 float *malloc_and_point_activations(ActivationTensors *acts, const size_t *act_sizes)
 {
     float **ptrs[] = {
-        &acts->encoded, &acts->ln1, &acts->atty,
+        &acts->encoded, &acts->freq_cos, &acts->freq_sin & acts->ln1, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2,
         &acts->fch, &acts->fch_glu, &acts->fch_swiglu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->losses, &acts->qkvr, &acts->output};
@@ -1566,7 +1713,10 @@ float *malloc_and_point_activations(ActivationTensors *acts, const size_t *act_s
 float *malloc_and_point_backward(GradActTensors *acts, const size_t *act_sizes)
 {
     float **ptrs[] = {
-        &acts->bt4c, &acts->preatt, &acts->residual3};
+        &acts->bt4c,
+        &acts->preatt,
+        &acts->residual3,
+    };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
@@ -1645,15 +1795,75 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
 
     // read in all the parameters from file and copy them to device
-    size_t lmaoSize = sizeof(num_parameters);
-    printf("Lmao-Size: %ld", lmaoSize);
     float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
-    size_t param_cpu_size = sizeof(params_memory_cpu);
-    printf("param_cpu_size: %ld ", param_cpu_size);
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
-    free(params_memory_cpu);
+    // cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     fcloseCheck(model_file);
+
+    // other inits
+    model->acts_memory = NULL;
+    model->grads_memory = NULL;
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+    model->grads_acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    model->cpu_losses = NULL;
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
+// ---------------------------------------------------------------
+
+// Xavier Initialization
+void xavier_initialization(float *param_values, size_t size, size_t fan_in, size_t fan_out)
+{
+    float scale = sqrt(2.0 / (fan_in + fan_out));
+    for (size_t i = 0; i < size; i++)
+    {
+        param_values[i] = scale * ((float)rand() / RAND_MAX - 0.5);
+    }
+}
+
+void load_model_params(GPT2 *model)
+{
+    // Initialize model configuration and parameters from given param_values
+    model->config.max_seq_len = 1024;
+    model->config.vocab_size = 50257;
+    model->config.num_layers = 12;
+    model->config.num_heads = 12;
+    model->config.channels = 768;
+    model->config.padded_vocab_size = 50304;
+
+    // allocate space for all the parameters and point them to the right places
+    fill_in_parameter_sizes(model->param_sizes, model->config);
+
+    // count the number of parameters
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
+    {
+        num_parameters += model->param_sizes[i];
+    }
+    model->num_parameters = num_parameters;
+
+    // Allocate CPU memory for parameter values
+    float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
+
+    // Initialize parameter values on the CPU
+    size_t offset = 0;
+    for (size_t i = 0; i < 18; i++)
+    {
+        size_t size = model->param_sizes[i];
+        size_t fan_in = (i == 0) ? model->config.padded_vocab_size : model->config.channels;
+        size_t fan_out = (i == 0) ? model->config.channels : model->config.channels;
+        xavier_initialization(params_memory_cpu + offset, size, fan_in, fan_out);
+        offset += size;
+    }
+
+    // Allocate GPU memory for parameters and copy from CPU
+    model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes, 1);
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
 
     // other inits
     model->acts_memory = NULL;
@@ -1740,7 +1950,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float *residual;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    // The freq_cos and freq_sin (cis-values) are same for every layer in the model. So, loading them for one time only
+    // TODO: Extract them from activations (if needed)
+    float *freq_cos = acts.freq_cos;
+    float *freq_sin = acts.freq_sin;
+    encoder_forward(acts.encoded, model->inputs, params.wte, B, T, C);    // encoding goes into residual[0]
+    precompute_freqs_cis(freq_cos, freq_sin, ((C / NH) / 2), T, 10000.0); // theta = 10000.0
 
     for (int l = 0; l < L; l++)
     {
@@ -1787,7 +2002,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
         // now do the forward pass
         rmsnorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C);
-        attention_forward_gqa(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, 6);
+        attention_forward_gqa(l_atty, l_qkvr, l_att, scratch, freq_cos, freq_cos, B, T, C, NH, 6); // Added  acts.freq_cos, acts.freq_sin for q and k - RoPE
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B * T * C);
         rmsnorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1886,6 +2101,11 @@ void gpt2_backward(GPT2 *model)
     ActivationTensors acts = model->acts;
     GradActTensors grads_acts = model->grads_acts;
 
+    // The freq_cos and freq_sin activations are same for every layer in the mode. So, loading them for one time only
+    // Same goes for their grads accumulation (Needed because we have to traverse from attention to precompute kernel)
+    float *freq_cos = acts.freq_cos;
+    float *freq_sin = acts.freq_sin;
+
     // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
     // this was done in the fused classifier kernel as last step of forward pass
     // technically that is a small, inline backward() pass of calculating
@@ -1964,12 +2184,13 @@ void gpt2_backward(GPT2 *model)
         float *buffer_a = l_atty;
         float *buffer_b = l_fch; // this is B x T x 4C, so even larger than what we need
 
-        attention_backward_gqa(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, 6);
+        attention_backward_gqa(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, freq_cos, freq_sin, l_qkvr, l_att, B, T, C, NH, 6);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         rmsnorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_btc, residual, l_ln1w, B, T, C);
     }
-    encoder_backward(grads.wte, grads.wpe, dresidual, model->inputs, B, T, C);
+
+    encoder_backward(grads.wte, dresidual, model->inputs, B, T, C);
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t)
@@ -2229,7 +2450,8 @@ int main(int argc, char *argv[])
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    // gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    load_model_params(&model);
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
