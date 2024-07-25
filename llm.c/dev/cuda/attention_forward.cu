@@ -818,7 +818,7 @@ void attention_forward2(float *out,
         + (row_tile_size * sizeof(float))   // SRAM size for Qi
         + (Bc * Br * sizeof(float));        // SRAM size for S
     int max_sram_size;
-    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    3(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
     if (sram_size > max_sram_size)
     {
         printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);

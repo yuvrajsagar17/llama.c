@@ -33,7 +33,7 @@ tri4
 #include <cooperative_groups/reduce.h>
 #include "common.h"
 
-static float* d_qkvr;   // scratch for the cublas kernel
+static float *d_qkvr; // scratch for the cublas kernel
 
 /*                    ** Chapter I - Introduction **
  *
@@ -61,40 +61,46 @@ static float* d_qkvr;   // scratch for the cublas kernel
  *  to shine!
  */
 
-
 // taken from then attention forward pass
-void trimul_cpu(float* out, const float* inp,
-                int B, int T, int C, int NH) {
+void trimul_cpu(float *out, const float *inp,
+                int B, int T, int C, int NH)
+{
     // inp shape: (B, T, 3, NH, HS)
     // out shape: (B, NH, T, T)
-    int C3 = C*3;
+    int C3 = C * 3;
     int HS = C / NH; // head size
     float scale = 1.0 / sqrtf(HS);
 
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int nh = 0; nh < NH; nh++) {
+    for (int b = 0; b < B; b++)
+    {
+        for (int t = 0; t < T; t++)
+        {
+            for (int nh = 0; nh < NH; nh++)
+            {
                 // Q[b][nh][t][:] = inp[b][t][0][nh][:] (where : is the slice operator for hs)
-                const float* query_t = inp + b * T * C3 + t * C3 + nh * HS;
+                const float *query_t = inp + b * T * C3 + t * C3 + nh * HS;
                 // out[b][nh][t][:]
-                float* out_bth = out + b * NH * T * T + nh * T * T + t * T;
+                float *out_bth = out + b * NH * T * T + nh * T * T + t * T;
 
                 // pass 1: calculate query dot key and maxval
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (int t2 = 0; t2 <= t; t2++)
+                {
                     // K[b][nh][t2][:] = inp[b][t2][1][nh][:]
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + nh * HS + C; // +C because it's key
+                    const float *key_t2 = inp + b * T * C3 + t2 * C3 + nh * HS + C; // +C because it's key
 
                     // Q[b][nh][t][:] dot K[b][nh][t2][:]
                     float val = 0.0f;
-                    for (int i = 0; i < HS; i++) {
+                    for (int i = 0; i < HS; i++)
+                    {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
 
-                     // out[b][nh][t][t2] = val
+                    // out[b][nh][t][t2] = val
                     out_bth[t2] = val;
                 }
-                for(int t2 = t + 1; t2 < T; ++t2) {
+                for (int t2 = t + 1; t2 < T; ++t2)
+                {
                     // causal mask, using NAN to supress warnings -> it could be -inf
                     // but it doesn't matter because in validate_result we ignore infinities/NANs
                     out_bth[t2] = NAN;
@@ -104,16 +110,18 @@ void trimul_cpu(float* out, const float* inp,
     }
 }
 
-__global__ void permute_kernel(float* q, float* k, float* v,
-                               const float* inp,
-                               int B, int T, int NH, int HS) {
+__global__ void permute_kernel(float *q, float *k, float *v,
+                               const float *inp,
+                               int B, int T, int NH, int HS)
+{
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, T, HS)
     // but instead, we have a single tensor QKV (inp) of shape (B, T, 3, NH, HS)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Q[b][nh][t][hs] = inp[b][t][0][nh][hs]
 
-    if (idx < B * NH * T * HS) {
+    if (idx < B * NH * T * HS)
+    {
         int b = idx / (NH * T * HS);
         int rest = idx % (NH * T * HS);
         int nh = rest / (T * HS);
@@ -121,12 +129,8 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         int t = rest / HS;
         int hs = rest % HS;
 
-        int inp_idx = \
-            (b * T * 3 * NH * HS)
-            +   (t * 3 * NH * HS)
-            +       (0 * NH * HS)
-            +          (nh * HS)
-            +                hs;
+        int inp_idx =
+            (b * T * 3 * NH * HS) + (t * 3 * NH * HS) + (0 * NH * HS) + (nh * HS) + hs;
 
         q[idx] = inp[inp_idx];
         k[idx] = inp[inp_idx + NH * HS];
@@ -134,14 +138,14 @@ __global__ void permute_kernel(float* q, float* k, float* v,
     }
 }
 
-
-void trimul_cublas(float* preatt,
-                   const float* inp,
-                   int B, int T, int C, int NH) {
+void trimul_cublas(float *preatt,
+                   const float *inp,
+                   int B, int T, int C, int NH)
+{
     int HS = C / NH; // head size
 
     // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
-    float* q, * k, * v;
+    float *q, *k, *v;
     q = d_qkvr + 0 * B * T * C;
     k = d_qkvr + 1 * B * T * C;
     v = d_qkvr + 2 * B * T * C;
@@ -210,16 +214,17 @@ void trimul_cublas(float* preatt,
  */
 
 // using creates an alias for a function pointer
-using matmul_fn_ptr = void(*)(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha);
+using matmul_fn_ptr = void (*)(float *p, int PS, const float *k, int KS, const float *q, int QS, int T, int HS, float alpha);
 
-template<matmul_fn_ptr matmul_tri>
-__global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float* inp, int T, int C, int NH) {
+template <matmul_fn_ptr matmul_tri>
+__global__ void __launch_bounds__(256, 2) trimul_global(float *out, const float *inp, int T, int C, int NH)
+{
     // skip above the diagonal
-    if(blockIdx.y > blockIdx.x)
+    if (blockIdx.y > blockIdx.x)
         return;
 
     // set up indices
-    int C3 = C*3;
+    int C3 = C * 3;
     int HS = C / NH; // head size
     float scale = 1.0 / sqrtf(HS);
 
@@ -229,16 +234,17 @@ __global__ void __launch_bounds__(256, 2) trimul_global(float* out, const float*
 
     // Get the base address for the current batch and head
     // shapes -> inp (B, T, 3, NH, HS), Q (B, NH, T, HS), K (B, NH, T, HS)
-    const float* q = inp + b * T * C3 + nh * HS;  // Q[b][nh][:][:] = inp[b][:][0][nh][:]
-    const float* k = inp + b * T * C3 + nh * HS + C;  // K[b][nh][:][:] = inp[b][:][1][nh][:]
-    float* r = out + (b*NH + nh)*T*T;  // out[b][nh][:][:]
+    const float *q = inp + b * T * C3 + nh * HS;     // Q[b][nh][:][:] = inp[b][:][0][nh][:]
+    const float *k = inp + b * T * C3 + nh * HS + C; // K[b][nh][:][:] = inp[b][:][1][nh][:]
+    float *r = out + (b * NH + nh) * T * T;          // out[b][nh][:][:]
 
     // start the multiplication
     matmul_tri(r, T, k, C3, q, C3, T, HS, scale);
 }
 
-template<matmul_fn_ptr matmul_tri>
-void trimul_launcher(float* out, const float* inp, int B, int T, int C, int NH) {
+template <matmul_fn_ptr matmul_tri>
+void trimul_launcher(float *out, const float *inp, int B, int T, int C, int NH)
+{
     // we assume nice shapes here. Let's not make the code a mess by supporting weird shapes that you
     // wouldn't want to use anyway.
     assert(T % 128 == 0);
@@ -277,7 +283,8 @@ void trimul_launcher(float* out, const float* inp, int B, int T, int C, int NH) 
  */
 
 // baseline implementation: 20 ms
-__device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+__device__ void matmul_tri_naive(float *p, int PS, const float *k, int KS, const float *q, int QS, int T, int HS, float alpha)
+{
     // coordinate system:
     // | - - - - - > j
     // |
@@ -293,16 +300,19 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const
     // to the upper triangle that should be masked out. This will be ignored due to the causal mask
     // in the reference CPU implementation when used in the `validate_result` function.
     // Alternatively this check should be done in the nested for loop below -> if (i > j) return.
-    if(j_base > i_base)
+    if (j_base > i_base)
         return;
 
     // Simple nested loop that calculates 8x8 results in one thread.
-    for(int io = 0; io < 8; ++io) {
+    for (int io = 0; io < 8; ++io)
+    {
         int i = i_base + io;
-        for(int jo = 0; jo < 8; ++jo) {
+        for (int jo = 0; jo < 8; ++jo)
+        {
             int j = j_base + jo;
             float val = 0;
-            for (int s = 0; s < HS; ++s) {
+            for (int s = 0; s < HS; ++s)
+            {
                 val += q[i * QS + s] * k[j * KS + s];
             }
             p[i * PS + j] = val * alpha;
@@ -340,7 +350,8 @@ __device__ void matmul_tri_naive(float* p, int PS, const float* k, int KS, const
  */
 
 // reorganize loops to enable data reuse: 3.5 ms
-__device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+__device__ void matmul_tri_registers(float *p, int PS, const float *k, int KS, const float *q, int QS, int T, int HS, float alpha)
+{
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -353,23 +364,29 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, c
     p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int hs = 0; hs < HS; ++hs) {
+    for (int hs = 0; hs < HS; ++hs)
+    {
         float lhs[8];
         float rhs[8];
-        for (int u = 0; u < 8; ++u) {
+        for (int u = 0; u < 8; ++u)
+        {
             lhs[u] = q[u * QS + hs];
             rhs[u] = k[u * KS + hs];
         }
 
-        for (int i = 0; i < 8; ++i) {
-            for (int j = 0; j < 8; ++j) {
+        for (int i = 0; i < 8; ++i)
+        {
+            for (int j = 0; j < 8; ++j)
+            {
                 vals[i][j] += lhs[i] * rhs[j];
             }
         }
     }
 
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; ++j) {
+    for (int i = 0; i < 8; ++i)
+    {
+        for (int j = 0; j < 8; ++j)
+        {
             p[i * PS + j] = vals[i][j] * alpha;
         }
     }
@@ -403,16 +420,19 @@ __device__ void matmul_tri_registers(float* p, int PS, const float* k, int KS, c
  */
 
 // convenient helper functions to make the code below more readable
-__device__ float4 ld_vec(const float* address) {
-    return *reinterpret_cast<const float4*>(address);
+__device__ float4 ld_vec(const float *address)
+{
+    return *reinterpret_cast<const float4 *>(address);
 }
 
-__device__ void st_vec(float* address, float4 val) {
-    *reinterpret_cast<float4*>(address) = val;
+__device__ void st_vec(float *address, float4 val)
+{
+    *reinterpret_cast<float4 *>(address) = val;
 }
 
 // vector instructions for coalesced memory access: 1.7 ms
-__device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+__device__ void matmul_tri3(float *p, int PS, const float *k, int KS, const float *q, int QS, int T, int HS, float alpha)
+{
     // Same logic as previous kernel we just load in float4 to improve coalescing
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
@@ -426,17 +446,21 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
     p += i_base * PS + j_base;
 
     float vals[8][8] = {};
-    for (int hs = 0; hs < HS; hs += 4) {
+    for (int hs = 0; hs < HS; hs += 4)
+    {
         // load in float4 to improve coalescing
         float4 rhs[8];
-        for (int u = 0; u < 8; ++u) {
+        for (int u = 0; u < 8; ++u)
+        {
             rhs[u] = ld_vec(k + u * KS + hs);
         }
 
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 8; ++i)
+        {
             // no need to keep lhs around for the i loop, it's only reused in the j loop anyway.
             float4 lhs = ld_vec(q + i * QS + hs);
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < 8; ++j)
+            {
                 vals[i][j] += lhs.x * rhs[j].x;
                 vals[i][j] += lhs.y * rhs[j].y;
                 vals[i][j] += lhs.z * rhs[j].z;
@@ -445,8 +469,10 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
         }
     }
 
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 8; j += 4) {
+    for (int i = 0; i < 8; ++i)
+    {
+        for (int j = 0; j < 8; j += 4)
+        {
             float4 result;
             result.x = vals[i][j + 0] * alpha;
             result.y = vals[i][j + 1] * alpha;
@@ -473,7 +499,8 @@ __device__ void matmul_tri3(float* p, int PS, const float* k, int KS, const floa
  *  details.]
  *
  */
-__device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const float* q, int QS, int T, int HS, float alpha) {
+__device__ void matmul_tri4(float *p, int PS, const float *k, int KS, const float *q, int QS, int T, int HS, float alpha)
+{
     int i_base = 128 * blockIdx.x + 8 * threadIdx.x;
     int j_base = 128 * blockIdx.y + 8 * threadIdx.y;
 
@@ -489,7 +516,8 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
     __shared__ float rhs_s[128][32];
 
     float vals[8][8] = {};
-    for (int so = 0; so < HS; so += 32) {
+    for (int so = 0; so < HS; so += 32)
+    {
         // Read a large slice of the input, worked on together by all threads.
         // They are organized differently for this part. We want to ensure
         // fully coalesced loads, so we let a single warp handle consecutive
@@ -500,7 +528,8 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
         // note2: 16x16 threads (i.e. the block) will, through this for loop, fetch 32 dims from 128 keys and 128 queries
         // i.e. from Q/K, of shape (T, HS) take q[:128, so*32:(so+1)*32] and k[:128, so*32:(so+1)*32]
         __syncthreads();
-        for(int y = threadIdx.y / 2; y < 128; y += 8) {
+        for (int y = threadIdx.y / 2; y < 128; y += 8)
+        {
             int xo = (threadIdx.y % 2) * 16;
             lhs_s[y][threadIdx.x + xo] = q[y * QS + so + threadIdx.x + xo];
             rhs_s[y][threadIdx.x + xo] = k[y * KS + so + threadIdx.x + xo];
@@ -514,15 +543,19 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
         // In the next iterations of the outer (`so`) loop we'll be accumulating values to `vals` until we
         // get the full dot product. We then later deposit it into the output matrix for all 8x8 blocks
         // that are below the diagonal.
-        for (int si = 0; si < 32; ++si) {
+        for (int si = 0; si < 32; ++si)
+        {
             float rhs[8];
-            for (int u = 0; u < 8; ++u) {
+            for (int u = 0; u < 8; ++u)
+            {
                 rhs[u] = rhs_s[u + 8 * threadIdx.y][(si + threadIdx.x) % 32];
             }
 
-            for (int ii = 0; ii < 8; ++ii) {
+            for (int ii = 0; ii < 8; ++ii)
+            {
                 float lhs = lhs_s[ii + 8 * threadIdx.x][(si + threadIdx.x) % 32];
-                for (int ji = 0; ji < 8; ++ji) {
+                for (int ji = 0; ji < 8; ++ji)
+                {
                     vals[ii][ji] += lhs * rhs[ji];
                 }
             }
@@ -533,8 +566,10 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
     if (j_base > i_base)
         return;
 
-    for (int ii = 0; ii < 8; ++ii) {
-        for (int ji = 0; ji < 8; ji += 4) {
+    for (int ii = 0; ii < 8; ++ii)
+    {
+        for (int ji = 0; ji < 8; ji += 4)
+        {
             int i = i_base + ii;
             int j = j_base + ji;
             float4 result;
@@ -562,33 +597,34 @@ __device__ void matmul_tri4(float* p, int PS, const float* k, int KS, const floa
  */
 
 void trimul_gpu(int kernel_num,
-                float* out,  const float* inp,
-                int B, int T, int C, int NH) {
-    switch (kernel_num) {
-        case 0:
-            trimul_cublas(out, inp, B, T, C, NH);
-            break;
-        case 1:
-            trimul_launcher<matmul_tri_naive>(out, inp, B, T, C, NH);
-            break;
-        case 2:
-            trimul_launcher<matmul_tri_registers>(out, inp, B, T, C, NH);
-            break;
-        case 3:
-            trimul_launcher<matmul_tri3>(out, inp, B, T, C, NH);
-            break;
-        case 4:
-            trimul_launcher<matmul_tri4>(out, inp, B, T, C, NH);
-            break;
-        default:
-            printf("Invalid kernel number\n");
-            exit(1);
+                float *out, const float *inp,
+                int B, int T, int C, int NH)
+{
+    switch (kernel_num)
+    {
+    case 0:
+        trimul_cublas(out, inp, B, T, C, NH);
+        break;
+    case 1:
+        trimul_launcher<matmul_tri_naive>(out, inp, B, T, C, NH);
+        break;
+    case 2:
+        trimul_launcher<matmul_tri_registers>(out, inp, B, T, C, NH);
+        break;
+    case 3:
+        trimul_launcher<matmul_tri3>(out, inp, B, T, C, NH);
+        break;
+    case 4:
+        trimul_launcher<matmul_tri4>(out, inp, B, T, C, NH);
+        break;
+    default:
+        printf("Invalid kernel number\n");
+        exit(1);
     }
 }
 
-
-
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     setup_main();
 
     int B = 8;
@@ -597,12 +633,12 @@ int main(int argc, char **argv) {
     int NH = 12;
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * NH * T * T * sizeof(float));
-    float* inp = make_random_float(B * T * 3 * C);
+    float *out = (float *)malloc(B * NH * T * T * sizeof(float));
+    float *inp = make_random_float(B * T * 3 * C);
 
     // move to GPU
-    float* d_out;
-    float* d_inp;
+    float *d_out;
+    float *d_inp;
     cudaCheck(cudaMalloc(&d_out, B * NH * T * T * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * 3 * C * sizeof(float)));
     cudaCheck(cudaMemcpy(d_inp, inp, B * T * 3 * C * sizeof(float), cudaMemcpyHostToDevice));
@@ -612,7 +648,8 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
-    if (argc > 1) {
+    if (argc > 1)
+    {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
@@ -630,7 +667,6 @@ int main(int argc, char **argv) {
     float elapsed_time = benchmark_kernel(repeat_times, trimul_gpu,
                                           kernel_num, d_out, d_inp,
                                           B, T, C, NH);
-
 
     float cublas_time = benchmark_kernel(repeat_times, trimul_gpu,
                                          0, d_out, d_inp,

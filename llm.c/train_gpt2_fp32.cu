@@ -1533,7 +1533,7 @@ void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config)
     param_sizes[6] = L * C;            // attprojb
     param_sizes[7] = L * C;            // ln2w
     param_sizes[8] = L * C;            // ln2b
-    param_sizes[8] = L * (4 * C) * C;  // fcw
+    param_sizes[9] = L * (4 * C) * C;  // fcw
     param_sizes[10] = L * (4 * C);     // fcb
     param_sizes[11] = L * (4 * C) * C; // fcw_g
     param_sizes[12] = L * (4 * C);     // fcb_g
@@ -1652,7 +1652,7 @@ void fill_in_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 5
+#define NUM_BACKWARD_TENSORS 3
 typedef struct
 {
     float *bt4c;      // (B, T, 4*C)
@@ -1797,7 +1797,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
     // read in all the parameters from file and copy them to device
     float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
     freadCheck(params_memory_cpu, sizeof(float), num_parameters, model_file);
-    // cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(model->params_memory, params_memory_cpu, num_parameters * sizeof(float), cudaMemcpyHostToDevice));
     fcloseCheck(model_file);
 
     // other inits
@@ -1839,6 +1839,13 @@ void load_model_params(GPT2 *model)
     // allocate space for all the parameters and point them to the right places
     fill_in_parameter_sizes(model->param_sizes, model->config);
 
+    // // Debug: Print each parameter size
+    // printf("Parameter sizes:\n");
+    // for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
+    // {
+    //     printf("param_sizes[%zu] = %zu\n", i, model->param_sizes[i]);
+    // }
+
     // count the number of parameters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
@@ -1846,6 +1853,9 @@ void load_model_params(GPT2 *model)
         num_parameters += model->param_sizes[i];
     }
     model->num_parameters = num_parameters;
+
+    // // Debug: Print the total number of parameters
+    // printf("Total number of parameters: %zu\n", num_parameters);
 
     // Allocate CPU memory for parameter values
     float *params_memory_cpu = (float *)mallocCheck(num_parameters * sizeof(float));
