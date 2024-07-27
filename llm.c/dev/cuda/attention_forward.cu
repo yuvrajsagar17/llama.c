@@ -325,7 +325,7 @@ __global__ void softmax_forward_kernel4(float *out, const float *inp, int N, int
         // store the final max in the first position
         maxvals[0] = val;
     }
-    __syncthreads();
+    ();
     // broadcast the max to all threads
     float offset = maxvals[0];
 

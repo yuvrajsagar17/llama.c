@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "*.tcc": "cpp",
-        "optional": "cpp"
+        "optional": "cpp",
+        "random": "cpp"
     }
 }

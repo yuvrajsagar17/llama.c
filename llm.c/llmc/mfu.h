@@ -10,15 +10,16 @@
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2
 
-typedef struct {
-    float TF_32;       // tensor-core performance 32 bit
-    float BF_16_32;    // bf16 with 32 bit accumulate
-    float FP_16_32;    // fp16 with 32 bit accumulate
-    float FP_16_16;    // fp16 with 16 bit accumulate
-    float FP_8_32;     // and so on
+typedef struct
+{
+    float TF_32;    // tensor-core performance 32 bit
+    float BF_16_32; // bf16 with 32 bit accumulate
+    float FP_16_32; // fp16 with 32 bit accumulate
+    float FP_16_16; // fp16 with 16 bit accumulate
+    float FP_8_32;  // and so on
     float FP_8_16;
-    float CLOCK;        // clock frequency from the spec sheet
-    float CORES;        // #TCs from the spec sheet
+    float CLOCK; // clock frequency from the spec sheet
+    float CORES; // #TCs from the spec sheet
 } PerfData;
 
 // basic default data from the nvidia whitepapers
@@ -28,9 +29,10 @@ static const PerfData AMPERE_CONSUMER = {40.f, 80.f, 80.f, 160.f, -1.f, -1.f, 18
 static const PerfData HOPPER = {378.f, 756.f, 756.f, 756.f, 1513.f, 1513.f, 1620.f, 456.f};
 static const PerfData ADA = {82.6f, 165.2f, 165.2f, 330.3f, 330.3f, 660.6f, 2520.f, 512.f};
 
-typedef struct {
-    const char* name;
-    const PerfData* perf_data;
+typedef struct
+{
+    const char *name;
+    const PerfData *perf_data;
     float new_cores;
     float new_mhz;
 } GPUEntry;
@@ -77,7 +79,8 @@ static GPUEntry gpu_db[] = {
     {"NVIDIA H100 80GB HBM3", &HOPPER, 528, 1830}, // HBM3 = SXM5
 };
 
-float get_flops_promised(const char* device, int precision_mode) {
+float get_flops_promised(const char *device, int precision_mode)
+{
     /*
     This function is used to estimate the Model Flops Utilization (MFU)
     basically we have to figure out how many flops the GPU can do per second.
@@ -99,26 +102,39 @@ float get_flops_promised(const char* device, int precision_mode) {
     https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
     */
 
-   // validate the precision mode as one of the three possible values
-    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 || precision_mode == MFUH_PRECISION_BF16)) {
+    // validate the precision mode as one of the three possible values
+    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 || precision_mode == MFUH_PRECISION_BF16))
+    {
         fprintf(stderr, "Invalid precision mode: %d\n", precision_mode);
         return -1.0f;
     }
 
     // do a linear search until you find our GPU, then calculate the flops promised
     int num_gpu_entries = sizeof(gpu_db) / sizeof(gpu_db[0]);
-    for (int i = 0; i < num_gpu_entries; i++) {
-        if (strcmp(gpu_db[i].name, device) == 0) {
-            const PerfData* perf_data = gpu_db[i].perf_data;
+    for (int i = 0; i < num_gpu_entries; i++)
+    {
+        if (strcmp(gpu_db[i].name, device) == 0)
+        {
+            const PerfData *perf_data = gpu_db[i].perf_data;
 
             // look up the default flops value for the given precision mode
             float value = -1.0f;
-            if (precision_mode == MFUH_PRECISION_BF16) { value = perf_data->BF_16_32; }
-            if (precision_mode == MFUH_PRECISION_FP32) { value = perf_data->TF_32; }
-            if (precision_mode == MFUH_PRECISION_FP16) { value = perf_data->FP_16_32; }
+            if (precision_mode == MFUH_PRECISION_BF16)
+            {
+                value = perf_data->BF_16_32;
+            }
+            if (precision_mode == MFUH_PRECISION_FP32)
+            {
+                value = perf_data->TF_32;
+            }
+            if (precision_mode == MFUH_PRECISION_FP16)
+            {
+                value = perf_data->FP_16_32;
+            }
 
             // we'd get here if we're e.g. trying to use BF16 on Volta GPU or something...
-            if (value < 0.0f) {
+            if (value < 0.0f)
+            {
                 fprintf(stderr, "No data for GPU %s and precision mode %d\n", device, precision_mode);
                 return -1.0f;
             }
