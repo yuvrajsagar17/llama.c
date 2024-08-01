@@ -1180,7 +1180,7 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
         cudaMalloc((void **)&new_k, B * NH * T * HS * sizeof(float));
         cudaMalloc((void **)&new_v, B * NH * T * HS * sizeof(float));
 
-        int repeat_interleave_threads = B * num_kv_heads * queries_per_kv * T * HS;
+        // int repeat_interleave_threads = B * num_kv_heads * queries_per_kv * T * HS;
         repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_k, k, B, num_kv_heads, T, HS, queries_per_kv);
         repeat_interleave_forward_kernel<<<num_blocks, block_size>>>(new_v, v, B, num_kv_heads, T, HS, queries_per_kv);
         cudaCheck(cudaGetLastError());
@@ -1225,7 +1225,7 @@ void attention_forward_gqa(float *out, float *qkvr, float *att, float *inp,
 }
 
 void attention_backward_gqa(float *dinp, float *dqkvr, float *dpreatt, float *datt,
-                            *scratch,
+                            float *scratch,
                             const float *dout,
                             const float *freq_cos, const float *freq_sin,
                             const float *qkvr, const float *att,
@@ -1703,7 +1703,7 @@ float *malloc_and_point(float **targets[], const size_t *act_sizes, int n)
 float *malloc_and_point_activations(ActivationTensors *acts, const size_t *act_sizes)
 {
     float **ptrs[] = {
-        &acts->encoded, &acts->freq_cos, &acts->freq_sin & acts->ln1, &acts->atty,
+        &acts->encoded, &acts->freq_cos, &acts->freq_sin, &acts->ln1, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2,
         &acts->fch, &acts->fch_glu, &acts->fch_swiglu, &acts->fcproj, &acts->residual3, &acts->lnf,
         &acts->losses, &acts->qkvr, &acts->output};
@@ -1862,7 +1862,7 @@ void load_model_params(GPT2 *model)
 
     // Initialize parameter values on the CPU
     size_t offset = 0;
-    for (size_t i = 0; i < 18; i++)
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
     {
         size_t size = model->param_sizes[i];
         size_t fan_in = (i == 0) ? model->config.padded_vocab_size : model->config.channels;
@@ -2349,6 +2349,15 @@ void error_usage()
     fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
     fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
     exit(EXIT_FAILURE);
+}
+
+void common_free(GPT2 &model) {
+    cudaCheck(cudaStreamDestroy(main_stream));
+    cudaCheck(cudaFree(cublaslt_workspace));
+    cublasCheck(cublasLtDestroy(cublaslt_handle));
+    #ifdef ENABLE_CUDNN
+    destroy_cudnn();
+    #endif
 }
 
 // ----------------------------------------------------------------------------
