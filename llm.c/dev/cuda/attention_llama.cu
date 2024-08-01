@@ -28,26 +28,6 @@ nvcc -O3 --use_fast_math -lcublas -lcublasLt attention_llama.cu -o attention_lla
 #include "common.h"
 
 // ----------------------------------------------------------------------------
-// CUDA & cuDNN setup
-static bool first_run_validation = true; // always run e.g. permute on 1st run
-
-#ifdef ENABLE_CUDNN
-#include <cudnn_frontend.h>
-namespace fe = cudnn_frontend;
-#if CUBLAS_LOWP == CUDA_R_16BF
-#define CUDNN_16BIT fe::DataType_t::BFLOAT16
-#else
-#define CUDNN_16BIT fe::DataType_t::HALF
-#endif
-
-static cudnnHandle_t cudnn_handle;
-static size_t cudnn_workspace_size = 0; // dynamically allocated as needed (up to 256MiB!)
-static void *cudnn_workspace = NULL;
-
-#define checkCudaErr(err) assert((int)err == 0);
-#define checkCudnnErr(err) assert((int)err == 0);
-#endif // ENABLE_CUDNN
-// ----------------------------------------------------------------------------
 // CPU code reference
 
 void attention_forward_cpu(float *out, float *preatt, float *att,

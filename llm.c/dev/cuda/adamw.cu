@@ -38,8 +38,8 @@ void adamw_cpu(float *params_memory, const float *grads_memory, float *m_memory,
         float grad = grads_memory[i];
 
         // update the first moment (momentum)
-        float m = beta1 * m_memory[i] + (1.0f - beta1) * grad;
-        // update the second moment (RMSprop)
+        float m = beta1 *[i] + (1.0f - beta1) * grad;
+        // update the second moment (RMSprop)m_memory
         float v = beta2 * v_memory[i] + (1.0f - beta2) * grad * grad;
         // bias-correct both moments
         float m_hat = m / (1.0f - powf(beta1, t));

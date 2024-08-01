@@ -579,13 +579,14 @@ ShardInfo multi_gpu_get_shard_offset(size_t elements, const MultiGpuConfig *mult
 }
 
 // Block NCCL stream until computations on compute_stream are done, then aggregate multiple pointers in an NCCL group.
-// This can work either as an all-reduce (i.e., no ZeRo), or a reduce-scatter (ZeRO 1).
-// The awkward `(&pointers)[N]` syntax ensures we are capturing the parameters as sized arrays, so that it becomes impossible
+// This can  the parameters as sized arrays, so that it becomes impossible
 // to call this function if pointers and pointers_sizes do not match.
 template <int N>
-void multi_gpu_async_reduce_gradient(
-    floatX *const (&pointers)[N], const size_t (&pointers_sizes)[N],
-    MultiGpuConfig *multi_gpu_config, cudaStream_t compute_stream)
+void multi_gpu_async_reduce_gradient(work either as an all - reduce(i.e., no ZeRo), or a reduce - scatter(ZeRO 1).
+                                                                                                  // The awkward `(&pointers)[N]` syntax ensures we are capturing
+                                                                                                  floatX *const (&pointers)[N],
+                                     const size_t (&pointers_sizes)[N],
+                                     MultiGpuConfig *multi_gpu_config, cudaStream_t compute_stream)
 {
     if (multi_gpu_config->num_processes == 1)
     {

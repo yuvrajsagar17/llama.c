@@ -282,7 +282,7 @@ __global__ void softmax_forward_kernel4(float *out, const float *inp, int N, int
     // furthermore, each block_size threads get executed in warps of 32 threads
 
     // special reduction operations warpReduceMax/warpReduceSum are used for intra-warp reductions
-    // shared memory is used for inter-warp reduction
+    // shared memory is used for `inter-warp` reduction
     extern __shared__ float shared[];
     int idx = blockIdx.x;
     int tid = threadIdx.x;
@@ -1113,7 +1113,10 @@ void attention_forward5(float *out, floatX *vaccum, floatX *qkvr, floatX *preatt
     {
         permute_kernel_lowp<<<num_blocks, block_size>>>(q, k, v, inp, B, T, NH, HS);
     }
-
+    /**
+     * The "Strided Batched" (cublasGemmStridedBatchedEx) variant is useful when the matrices are stored in contiguous memory but separated by a fixed stride.
+     * Refrence: https://docs.nvidia.com/cuda/cublas/index.html?highlight=cublasSgemmStridedBatched#cublas-t-gemmstridedbatched
+     */
     // IMPORTANT: alpha/beta are FP32 for CUBLAS_COMPUTE_32F even if FP16 inputs/outputs
     // But need FP16 scale for CUBLAS_COMPUTE_16F (no errors otherwise, just garbage results *sigh*)
     const float alpha = 1.0f;
