@@ -2,6 +2,7 @@
     "files.associations": {
         "*.tcc": "cpp",
         "optional": "cpp",
-        "random": "cpp"
+        "random": "cpp",
+        "algorithm": "cpp"
     }
 }
