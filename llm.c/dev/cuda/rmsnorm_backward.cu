@@ -2,13 +2,13 @@
 Kernels for layernorm backward pass.
 
 Compile example:
-nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_backward.cu -o layernorm_backward
+nvcc -O3 --use_fast_math -lcublas -lcublasLt rmsnorm_backward.cu -o rmsnorm_backward
 
 version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
-./layernorm_backward 1
+./rmsnorm_backward 1
 
 version 2 moves a lot of reduction to shared memory over global memory
-./layernorm_backward 2
+./rmsnorm_backward 2
 */
 
 #include <stdio.h>
@@ -105,36 +105,6 @@ void rmsnorm_backward_cpu(float *dinp, float *dweight, float *dbias,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// GPU helper functions for atomicAdd on smaller than 32-bit types
-#ifdef ENABLE_BF16
-__device__ void atomicAddX(__nv_bfloat16 *addr, __nv_bfloat16 val)
-{
-    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
-    __nv_bfloat162 *ptr_bf16 = reinterpret_cast<__nv_bfloat162 *>(ptr_val & ~uintptr_t(0x3));
-
-    // Prepare the value to add, setting the other half to zero
-    __nv_bfloat162 add_val = (ptr_val & 0x3) ? __halves2bfloat162(__ushort_as_bfloat16(0), val)
-                                             : __halves2bfloat162(val, __ushort_as_bfloat16(0));
-    atomicAdd(ptr_bf16, add_val);
-}
-#endif
-#ifdef ENABLE_FP16
-__device__ void atomicAddX(half *addr, half val)
-{
-    uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
-    half2 *ptr_fp16 = reinterpret_cast<half2 *>(ptr_val & ~uintptr_t(0x3));
-
-    // Prepare the value to add, setting the other half to zero
-    half2 add_val = (ptr_val & 0x3) ? __halves2half2(__ushort_as_half(0), val)
-                                    : __halves2half2(val, __ushort_as_half(0));
-    atomicAdd(ptr_fp16, add_val);
-}
-#endif
-__device__ void atomicAddX(float *addr, float val)
-{
-    atomicAdd(addr, val);
-}
-
 __global__ void rmsnorm_backward_kernel1(float *dinp, float *dweight, float *dbias,
                                          const float *dout, const float *inp, const float *weight, const float *bias,
                                          int N, int C)
@@ -195,8 +165,8 @@ void rmsnorm_backward1(float *dinp, float *dweight, float *dbias,
 
 // kernel version dispatch
 void rmsnorm_backward(int kernel_num,
-                      floatX *dinp, floatX *dweight, floatX *dbias,
-                      const floatX *dout, const floatX *inp, const floatX *weight, const floatX *bias,
+                      float *dinp, float *dweight, float *dbias,
+                      const float *dout, const float *inp, const float *weight, const float *bias,
                       int B, int T, int C,
                       const int block_size)
 {
@@ -221,7 +191,7 @@ int main(int argc, char **argv)
 
     int B = 8;
     int T = 1024;
-    int C = 1600; // this is the problematic size
+    int C = 768; // corrected embed_dim
 
     // first do the forward pass in CPU
     float *out = (float *)malloc(B * T * C * sizeof(float));
@@ -252,21 +222,21 @@ int main(int argc, char **argv)
     printf("Using kernel %d\n", kernel_num);
 
     // move all the variables we need for backward pass onto the GPU
-    floatX *d_dinp;
-    floatX *d_dweight;
-    floatX *d_dbias;
-    floatX *d_dout;
-    floatX *d_inp;
-    floatX *d_weight;
-    floatX *d_bias;
+    float *d_dinp;
+    float *d_dweight;
+    float *d_dbias;
+    float *d_dout;
+    float *d_inp;
+    float *d_weight;
+    float *d_bias;
 
     float *d_scratch;
-    cudaCheck(cudaMalloc(&d_dinp, B * T * C * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&d_dweight, C * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&d_dbias, C * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
-    cudaCheck(cudaMalloc(&d_weight, C * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_dinp, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_dweight, C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_dbias, C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_weight, C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_scratch, (1024 / 32) * cuda_num_SMs * (2 * C + 1) * sizeof(float)));
     // copy over the "inputs" to the backward call
     cudaCheck(memcpy_convert(d_dout, dout, B * T * C));
@@ -281,16 +251,16 @@ int main(int argc, char **argv)
     {
         int block_size = block_sizes[j];
         // init the "outputs" of the backward call to zeros
-        cudaCheck(cudaMemset(d_dinp, 0, B * T * C * sizeof(floatX)));
-        cudaCheck(cudaMemset(d_dweight, 0, C * sizeof(floatX)));
-        cudaCheck(cudaMemset(d_dbias, 0, C * sizeof(floatX)));
+        cudaCheck(cudaMemset(d_dinp, 0, B * T * C * sizeof(float)));
+        cudaCheck(cudaMemset(d_dweight, 0, C * sizeof(float)));
+        cudaCheck(cudaMemset(d_dbias, 0, C * sizeof(float)));
 
         rmsnorm_backward(kernel_num, d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_bias,
                          B, T, C, block_size);
 
         // check the correctness of the kernel
-        float error_threshold_dinp = sizeof(floatX) == 4 ? 1e-3f : 1e-1f;    // allow larger errors for BF16/FP16
-        float error_threshold_dparams = sizeof(floatX) == 4 ? 1e-3f : 5e-1f; // much, much larger...
+        float error_threshold_dinp = sizeof(float) == 4 ? 1e-3f : 1e-1f;    // allow larger errors for BF16/FP16
+        float error_threshold_dparams = sizeof(float) == 4 ? 1e-3f : 5e-1f; // much, much larger...
         printf("Checking correctness...\n");
         printf("dinp:\n");
         validate_result(d_dinp, dinp, "dinp", B * T * C, error_threshold_dinp);
@@ -307,8 +277,8 @@ int main(int argc, char **argv)
     {
         int block_size = block_sizes[j];
         int repeat_times = 100;
-        float elapsed_time = benchmark_kernel(repeat_times, layernorm_backward, kernel_num,
-                                              d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
+        float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_backward_cpu, kernel_num,
+                                              d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_bias,
                                               B, T, C, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
     }
