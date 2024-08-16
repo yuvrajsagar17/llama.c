@@ -13,8 +13,11 @@ version 2 moves a lot of reduction to shared memory over global memory
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <cuda_runtime.h>
 #include <assert.h>
+#include <float.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
@@ -234,6 +237,7 @@ int main(int argc, char **argv)
     float *dinp = make_zeros_float(B * T * C);
     float *dweight = make_zeros_float(C);
     float *dbias = make_zeros_float(C);
+
     rmsnorm_backward_cpu(dinp, dweight, dbias, dout, inp, weight, bias, B, T, C);
 
     // the above calculations act as the reference
@@ -272,7 +276,7 @@ int main(int argc, char **argv)
 
     // launch the kernel
     // removed 768 because it doesn't work for kernel9 despite being OK in train_gpt2.cu?!
-    int block_sizes[] = {32, 64, 128, 256, 512, /*768,*/ 1024};
+    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
     {
         int block_size = block_sizes[j];
@@ -298,16 +302,16 @@ int main(int argc, char **argv)
         printf("All results match for block_size=%d.\n\n", block_size);
     }
 
-    // // now time the kernel
-    // for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
-    // {
-    //     int block_size = block_sizes[j];
-    //     int repeat_times = 100;
-    //     float elapsed_time = benchmark_kernel(repeat_times, layernorm_backward, kernel_num,
-    //                                           d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
-    //                                           B, T, C, block_size);
-    //     printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
-    // }
+    // now time the kernel
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
+    {
+        int block_size = block_sizes[j];
+        int repeat_times = 100;
+        float elapsed_time = benchmark_kernel(repeat_times, layernorm_backward, kernel_num,
+                                              d_dinp, d_dweight, d_dbias, d_scratch, d_dout, d_inp, d_weight, d_mean, d_rstd,
+                                              B, T, C, block_size);
+        printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
+    }
 
     // cleanups
     free(out);

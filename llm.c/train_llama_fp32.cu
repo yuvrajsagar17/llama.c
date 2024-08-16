@@ -1,5 +1,5 @@
 /*
-Mixtral Transformer Neural Net trained in raw CUDA
+GPT-2 Transformer Neural Net trained in raw CUDA
 Non-trivial notes to be aware of:
 
 We are being clever in the backward pass to conserve memory.
@@ -947,254 +947,8 @@ __global__ void __launch_bounds__(16 * 16, 2) matmul_forward_kernel4(float *out,
     }
 }
 
-// Kernel to perform top-k selection
-__global__ void topk_kernel_forward(float *top_values, int *top_indices, const float *scores, int rows, int cols, int k)
-{
-    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row_idx < rows)
-    {
-        extern __shared__ float shared_memory[];
-        float *shared_vals = shared_memory;
-        int *shared_indices = (int *)&shared_memory[cols];
-
-        // Load scores into shared memory
-        for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        {
-            shared_vals[i] = scores[row_idx * cols + i];
-            shared_indices[i] = i;
-        }
-        __syncthreads();
-
-        // Simple selection sort to find top-k values
-        for (int i = 0; i < k; ++i)
-        {
-            int max_idx = i;
-            for (int j = i + 1; j < cols; ++j)
-            {
-                if (shared_vals[j] > shared_vals[max_idx])
-                {
-                    max_idx = j;
-                }
-            }
-            // Swap values
-            float temp_val = shared_vals[i];
-            shared_vals[i] = shared_vals[max_idx];
-            shared_vals[max_idx] = temp_val;
-
-            // Swap indices
-            int temp_idx = shared_indices[i];
-            shared_indices[i] = shared_indices[max_idx];
-            shared_indices[max_idx] = temp_idx;
-        }
-
-        // Write top-k values and indices to global memory
-        for (int i = 0; i < k; ++i)
-        {
-            top_values[row_idx * k + i] = shared_vals[i];
-            top_indices[row_idx * k + i] = shared_indices[i];
-        }
-    }
-}
-
-// Kernel to perform top-k selection and softmax
-__global__ void topk_softmax_fused_kernel(float *top_values, int *top_indices, const float *scores, int rows, int cols, int k)
-{
-    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row_idx < rows)
-    {
-        extern __shared__ float shared_memory[];
-        float *shared_vals = shared_memory;
-        int *shared_indices = (int *)&shared_memory[cols];
-
-        // Load scores into shared memory
-        for (int i = threadIdx.x; i < cols; i += blockDim.x)
-        {
-            shared_vals[i] = scores[row_idx * cols + i];
-            shared_indices[i] = i;
-        }
-        __syncthreads();
-
-        // Simple selection sort to find top-k values
-        for (int i = 0; i < k; ++i)
-        {
-            int max_idx = i;
-            for (int j = i + 1; j < cols; ++j)
-            {
-                if (shared_vals[j] > shared_vals[max_idx])
-                {
-                    max_idx = j;
-                }
-            }
-            // Swap values
-            float temp_val = shared_vals[i];
-            shared_vals[i] = shared_vals[max_idx];
-            shared_vals[max_idx] = temp_val;
-
-            // Swap indices
-            int temp_idx = shared_indices[i];
-            shared_indices[i] = shared_indices[max_idx];
-            shared_indices[max_idx] = temp_idx;
-        }
-
-        // Compute softmax on top-k values
-        float max_val = shared_vals[0];
-        float sum_exp = 0.0;
-        for (int i = 0; i < k; ++i)
-        {
-            shared_vals[i] = expf(shared_vals[i] - max_val);
-            sum_exp += shared_vals[i];
-        }
-        for (int i = 0; i < k; ++i)
-        {
-            shared_vals[i] /= sum_exp;
-        }
-
-        // Write top-k values (softmax) and indices to global memory
-        for (int i = 0; i < k; ++i)
-        {
-            top_values[row_idx * k + i] = shared_vals[i];
-            top_indices[row_idx * k + i] = shared_indices[i];
-        }
-    }
-}
-
-__global__ void topk_softmax_fused_backward_kernel(float *d_scores, const float *d_top_values, const int *top_indices, const float *top_values, int rows, int cols, int k)
-{
-    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row_idx < rows)
-    {
-        extern __shared__ float shared_memory[];
-        float *shared_d_top_vals = shared_memory;
-        int *shared_indices = (int *)&shared_memory[k];
-
-        // Load top values and indices into shared memory
-        for (int i = threadIdx.x; i < k; i += blockDim.x)
-        {
-            shared_d_top_vals[i] = d_top_values[row_idx * k + i];
-            shared_indices[i] = top_indices[row_idx * k + i];
-        }
-        __syncthreads();
-
-        // Compute the softmax gradient
-        float sum_d_top_vals = 0.0;
-        for (int i = 0; i < k; ++i)
-        {
-            sum_d_top_vals += shared_d_top_vals[i] * top_values[row_idx * k + i];
-        }
-
-        for (int i = 0; i < k; ++i)
-        {
-            shared_d_top_vals[i] = top_values[row_idx * k + i] * (shared_d_top_vals[i] - sum_d_top_vals);
-        }
-
-        // Accumulate gradients back to the scores
-        for (int i = 0; i < k; ++i)
-        {
-            int idx = shared_indices[i];
-            atomicAdd(&d_scores[row_idx * cols + idx], shared_d_top_vals[i]);
-        }
-    }
-}
-
-// Kernel to perform repeat_interleave
-__global__ void repeat_interleave_dim0_kernel_forward(float *output, const float *input, int B, int T, int C, int num_repeats)
-{
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    int t = blockIdx.y;
-    int c = threadIdx.y;
-
-    if (b < B && t < T && c < C)
-    {
-        float value = input[b * T * C + t * C + c];
-        for (int i = 0; i < num_repeats; ++i)
-        {
-            int output_row = b * num_repeats + i;
-            output[output_row * B * C + t * C + c] = value;
-        }
-    }
-}
-// Kernel to perform backward pass of repeat_interleave
-__global__ void repeat_interleave_dim0_backward_kernel(float *d_input, const float *d_output, int B, int T, int C, int num_repeats)
-{
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
-    int t = blockIdx.y;
-    int c = threadIdx.y;
-
-    if (b < B && t < T && c < C)
-    {
-        float grad_value = 0.0f;
-        for (int i = 0; i < num_repeats; ++i)
-        {
-            int output_row = b * num_repeats + i;
-            grad_value += d_output[output_row * B * C + t * C + c];
-        }
-        d_input[b * T * C + t * C + c] = grad_value;
-    }
-}
-
 // ----------------------------------------------------------------------------
 // kernel launchers
-
-// Function to call the kernel
-void topk_forward(float *top_values, int *top_indices, const float *scores, int B, int T, int num_experts, int k)
-{
-    int rows = B * T;
-    int cols = num_experts;
-    int block_size = 256;
-    int grid_size = CEIL_DIV((rows + block_size - 1), block_size);
-
-    size_t shared_memory_size = 2 * cols * sizeof(float);
-
-    topk_kernel_forward<<<grid_size, block_size, shared_memory_size>>>(top_values, top_indices, scores, rows, cols, k);
-    cudaDeviceSynchronize();
-}
-
-// Function to call the kernel
-void repeat_interleave_dim0_forward(float *output, const float *input, int B, int T, int C, int num_repeats)
-{
-    dim3 blockDim(256, C); // 256 threads for rows and `dim` threads for columns
-    dim3 gridDim((B + blockDim.x - 1) / blockDim.x, T);
-
-    repeat_interleave_dim0_kernel_forward<<<gridDim, blockDim>>>(output, input, B, T, C, num_repeats);
-    cudaDeviceSynchronize();
-}
-
-// Function to call the backward kernel
-void repeat_interleave_dim0_backward(float *d_input, const float *d_output, int B, int T, int C, int num_repeats)
-{
-    dim3 blockDim(256, C); // 256 threads for rows and `dim` threads for columns
-    dim3 gridDim((B + blockDim.x - 1) / blockDim.x, T);
-
-    repeat_interleave_dim0_backward_kernel<<<gridDim, blockDim>>>(d_input, d_output, B, T, C, num_repeats);
-    cudaDeviceSynchronize();
-}
-
-// Function to call the kernel
-void topk_softmax_fused_forward(float *top_values, int *top_indices, const float *scores, int B, int T, int num_experts, int k)
-{
-    int rows = B * T;
-    int cols = num_experts;
-    int block_size = 256;
-    int grid_size = CEIL_DIV((rows + block_size - 1), block_size);
-
-    size_t shared_memory_size = 2 * cols * sizeof(float);
-
-    topk_softmax_fused_kernel<<<grid_size, block_size, shared_memory_size>>>(top_values, top_indices, scores, rows, cols, k);
-    cudaDeviceSynchronize();
-}
-
-// Function to call the backward kernel
-void topk_softmax_fused_backward(float *d_scores, const float *d_top_values, const int *top_indices, const float *top_values, int B, int T, int num_experts, int k)
-{
-    int rows = B * T;
-    int block_size = 256;
-    int grid_size = CEIL_DIV((rows + block_size - 1), block_size);
-
-    size_t shared_memory_size = k * sizeof(float) + k * sizeof(int);
-
-    topk_softmax_fused_backward_kernel<<<grid_size, block_size, shared_memory_size>>>(d_scores, d_top_values, top_indices, top_values, rows, num_experts, k);
-    cudaDeviceSynchronize();
-}
 
 void encoder_forward(float *out,
                      const int *inp, const float *wte,
@@ -1604,190 +1358,6 @@ __global__ void swiglu_backward_kernel(float *dinp, const float *inp, const floa
     }
 }
 
-void filter_input(float *filtered_inp, int *indices, const float *inp, const int *flat_expert_indices, int B, int T, int C, int expert_idx, int *count)
-{
-    int idx = 0;
-    for (int b = 0; b < B; ++b)
-    {
-        for (int t = 0; t < T; ++t)
-        {
-            if (flat_expert_indices[b * T + t] == expert_idx)
-            {
-                memcpy(&filtered_inp[idx * C], &inp[(b * T + t) * C], C * sizeof(float));
-                indices[idx] = b * T + t;
-                idx++;
-            }
-        }
-    }
-    *count = idx;
-}
-
-void store_filtered_output(float *out, float *filtered_out, int *indices, int count, int C)
-{
-    for (int i = 0; i < count; ++i)
-    {
-        memcpy(&out[indices[i] * C], &filtered_out[i * C], C * sizeof(float));
-    }
-}
-
-void forward_with_experts(float *out, float *w1, float *b1, float *w2, float *b2, float *w3, float *b3, float *inp, const int *flat_expert_indices, float *swiglu_xw, float *swiglu_xv, int B, int T, int C, int num_experts)
-{
-    for (int idx = 0; idx < num_experts; ++idx) // NUM_EXPERTS = 4
-    {
-        // Determine the size of filtered inputs
-        int max_count = B * T;
-        float *filtered_inp = (float *)malloc(max_count * C * sizeof(float));
-        float *filtered_out = (float *)malloc(max_count * C * sizeof(float));
-        float *filtered_input_xw = (float *)malloc(max_count * 4 * C * sizeof(float));
-        float *filtered_gate_xv = (float *)malloc(max_count * 4 * C * sizeof(float));
-        int *indices = (int *)malloc(max_count * sizeof(int));
-        int count = 0;
-
-        float *w1_idx_expert = w1 + idx * 4 * C * C;
-        float *b1_idx_expert = b1 + idx * 4 * C;
-        float *w2_idx_expert = w2 + idx * 4 * C * C;
-        float *b2_idx_expert = b2 + idx * 4 * C;
-        float *w3_idx_expert = w3 + idx * 4 * C * C;
-        float *b3_idx_expert = b3 + idx * 4 * C;
-
-        // Filter input based on flat_expert_indices
-        filter_input(filtered_inp, indices, inp, flat_expert_indices, B, T, C, idx, &count);
-        filter_input(filtered_input_xw, indices, swiglu_xw, flat_expert_indices, B, T, 4 * C, idx, &count);
-        filter_input(filtered_gate_xv, indices, swiglu_xv, flat_expert_indices, B, T, 4 * C, idx, &count);
-
-        // Call the forward function for the current expert
-        moe_expert_forward(filtered_out, filtered_inp,
-                           w1_idx_expert, b1_idx_expert, w2_idx_expert, b2_idx_expert, w3_idx_expert, b3_idx_expert,
-                           filtered_input_xw, filtered_gate_xv, count, 1, C);
-
-        // Store filtered output back to original output array
-        store_filtered_output(out, filtered_out, indices, count, C);
-        store_filtered_output(swiglu_xw, filtered_input_xw, indices, count, 4 * C);
-        store_filtered_output(swiglu_xv, filtered_gate_xv, indices, count, 4 * C);
-
-        // Free temporary buffers
-        free(filtered_inp);
-        free(filtered_out);
-        free(filtered_input_xw);
-        free(filtered_gate_xv);
-        free(indices);
-    }
-}
-
-// Main backward function for forward_with_experts
-void forward_with_experts_backward(float *dinp, float *d_w1, float *d_b1, float *d_w2, float *d_b2, float *d_w3, float *d_b3, const float *dout,
-                                   float *w1, float *b1, float *w2, float *b2, float *w3, float *b3,
-                                   const float *inp, const int *flat_expert_indices,
-                                   float *swiglu_xw, float *swiglu_xv,
-                                   int B, int T, int C, int num_experts)
-{
-    for (int idx = 0; idx < num_experts; ++idx) // NUM_EXPERTS = 4
-    {
-        // Determine the size of filtered inputs
-        int max_count = B * T;
-        float *filtered_inp = (float *)malloc(max_count * C * sizeof(float));
-        float *filtered_out = (float *)malloc(max_count * C * sizeof(float));
-        float *filtered_swiglu_xw = (float *)malloc(max_count * 4 * C * sizeof(float));
-        float *filtered_swiglu_xv = (float *)malloc(max_count * 4 * C * sizeof(float));
-        int *indices = (int *)malloc(max_count * sizeof(int));
-        int count = 0;
-
-        float *w1_idx_expert = w1 + idx * 4 * C * C;
-        float *b1_idx_expert = b1 + idx * 4 * C;
-        float *w2_idx_expert = w2 + idx * 4 * C * C;
-        float *b2_idx_expert = b2 + idx * 4 * C;
-        float *w3_idx_expert = w3 + idx * 4 * C * C;
-        float *b3_idx_expert = b3 + idx * 4 * C;
-
-        float *d_w1_idx_expert = d_w1 + idx * 4 * C * C;
-        float *d_b1_idx_expert = d_b1 + idx * 4 * C;
-        float *d_w2_idx_expert = d_w2 + idx * 4 * C * C;
-        float *d_b2_idx_expert = d_b2 + idx * 4 * C;
-        float *d_w3_idx_expert = d_w3 + idx * 4 * C * C;
-        float *d_b3_idx_expert = d_b3 + idx * 4 * C;
-
-        // Filter input based on flat_expert_indices
-        filter_input(filtered_inp, indices, inp, flat_expert_indices, B, T, C, idx, &count);
-        filter_input(filtered_swiglu_xw, indices, swiglu_xw, flat_expert_indices, B, T, 4 * C, idx, &count);
-        filter_input(filtered_swiglu_xv, indices, swiglu_xv, flat_expert_indices, B, T, 4 * C, idx, &count);
-
-        // Allocate space for intermediate gradients
-        float *d_filtered_inp = (float *)malloc(max_count * C * sizeof(float));
-        float *d_filtered_out = (float *)malloc(max_count * C * sizeof(float));
-
-        // Store filtered output gradients
-        filter_input(d_filtered_out, indices, dout, flat_expert_indices, B, T, C, idx, &count);
-
-        // Call the backward function for the current expert
-        moe_expert_backward(d_filtered_inp, d_w1_idx_expert, d_b1_idx_expert, d_w2_idx_expert, d_b2_idx_expert, d_w3_idx_expert, d_b3_idx_expert,
-                            d_filtered_out, filtered_out, filtered_inp,
-                            w1_idx_expert, b1_idx_expert, w2_idx_expert, b2_idx_expert, w3_idx_expert, b3_idx_expert,
-                            filtered_swiglu_xw, filtered_swiglu_xv, count, 1, C);
-
-        // Accumulate filtered input gradients back to original input gradient array
-        for (int i = 0; i < count; ++i)
-        {
-            for (int j = 0; j < C; ++j)
-            {
-                dinp[indices[i] * C + j] += d_filtered_inp[i * C + j];
-            }
-        }
-
-        // Free temporary buffers
-        free(filtered_inp);
-        free(filtered_out);
-        free(indices);
-        free(d_filtered_inp);
-        free(d_filtered_out);
-    }
-}
-
-// Kernel function to perform the element-wise multiplication and sum
-__global__ void expert_weights_sum_forward_kernel(float *output, float *output_logits, float *expert_weights, int B, int T, int C, int num_experts_per_token)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = B * T * C;
-
-    if (idx < total_elements)
-    {
-        int bt = idx / C; // Get the B*T index
-        int c = idx % C;  // Get the C index
-
-        float sum = 0.0f;
-        for (int i = 0; i < num_experts_per_token; ++i)
-        {
-            int output_idx = (bt * num_experts_per_token + i) * C + c;
-            int weight_idx = bt * num_experts_per_token + i;
-            sum += output_logits[output_idx] * expert_weights[weight_idx];
-        }
-        output[idx] = sum;
-    }
-}
-
-// Kernel function to perform the backward pass for expert_weights_sum_kernel
-__global__ void expert_weights_sum_backward_kernel(float *d_output_logits, float *d_expert_weights, const float *d_output, const float *output_logits, const float *expert_weights, const float *dout, int B, int T, int C, int num_experts_per_token)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = B * T * C;
-
-    if (idx < total_elements)
-    {
-        int bt = idx / C; // Get the B*T index
-        int c = idx % C;  // Get the C index
-
-        float d_out = d_output[idx];
-
-        for (int i = 0; i < num_experts_per_token; ++i)
-        {
-            int output_idx = (bt * num_experts_per_token + i) * C + c;
-            int weight_idx = bt * num_experts_per_token + i;
-
-            atomicAdd(&d_output_logits[output_idx], d_out * expert_weights[weight_idx] * dout[idx]);
-            atomicAdd(&d_expert_weights[weight_idx], d_out * output_logits[output_idx] * dout[idx]);
-        }
-    }
-}
-
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -1805,75 +1375,6 @@ void swiglu_backward(float *dinp, const float *inp, const float *gate, const flo
     const int grid_size = CEIL_DIV(N, block_size);
     swiglu_backward_kernel<<<grid_size, block_size>>>(dinp, inp, gate, dout, W, V, N);
     cudaCheck(cudaGetLastError());
-}
-
-void experts_weighted_sum_forward(float *output, float *output_logits, float *expert_weights, int B, int T, int C, int num_experts_per_token)
-{
-    // Define block and grid sizes
-    int blockSize = 256;
-    int grid_size = CEIL_DIV((B * T * C + blockSize - 1), blockSize);
-
-    // Launch the kernel
-    expert_weights_sum_forward_kernel<<<grid_size, blockSize>>>(output, output_logits, expert_weights, B, T, C, num_experts_per_token);
-}
-
-// Function to launch the backward pass kernel
-void experts_weighted_sum_backward(float *d_output_logits, float *d_expert_weights, const float *d_output, const float *output_logits, const float *expert_weights, const float *dout, int B, int T, int C, int num_experts_per_token)
-{
-    int blockSize = 256;
-    int grid_size = CEIL_DIV((B * T * C + blockSize - 1), blockSize);
-
-    expert_weights_sum_backward_kernel<<<grid_size, blockSize>>>(d_output_logits, d_expert_weights, d_output, output_logits, expert_weights, dout, B, T, C, num_experts_per_token);
-    cudaDeviceSynchronize();
-}
-
-void moe_expert_forward(float *out, float *inp, float *w1, float *b1, float *w2, float *b2, float *w3, float *b3, float *input_xw, float *gate_xv, int B, int T, int C)
-{
-    float *acc3;
-    int OC = 4 * C;
-
-    cudaCheck(cudaMalloc(&acc3, B * T * OC * sizeof(float)));
-
-    matmul_forward(input_xw, inp, w1, b1, B, T, C, OC);  // xW # (B, T, 4*C)
-    matmul_forward(gate_xv, inp, w2, b2, B, T, C, OC);   // xV # (B, T, 4*C)
-    swiglu_forward(acc3, input_xw, gate_xv, B * T * OC); // SiLU(xW)*gate(xV) # (B,T,4*C)
-    matmul_forward(out, acc3, w3, b3, B, T, OC, C);      // # (B,T,C) - Gets into original shape
-
-    cudaCheck(cudaFree(acc3));
-}
-
-// Placeholder function for moe_expert_backward (to be implemented next)
-__device__ void moe_expert_backward(float *d_filtered_inp, float *d_w1, float *d_b1, float *d_w2, float *d_b2, float *d_w3, float *d_b3,
-                                    float *dout, const float *filtered_out, const float *filtered_inp,
-                                    float *w1, float *b1, float *w2, float *b2, float *w3, float *b3,
-                                    const float *input_xw, const float *gate_xv, int B, int T, int C)
-{
-    // This function should implement the backward pass for the expert network
-    // and accumulate the gradients for the weights and biases.
-    int OC = 4 * C;
-
-    // Allocate space for intermediate gradients
-    float *d_acc1, *d_acc2, *d_acc3;
-    cudaCheck(cudaMalloc(&d_acc1, B * T * OC * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_acc2, B * T * OC * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_acc3, B * T * OC * sizeof(float)));
-
-    // Backward pass through the last matmul
-    matmul_backward(d_acc3, d_w3, d_b3, dout, input_xw, w3, B, T, OC, C);
-
-    // Backward pass through swiglu
-    swiglu_backward(d_acc1, input_xw, gate_xv, d_acc3, w1, w2, B * T * OC);
-
-    // Backward pass through the first matmul (w1)
-    matmul_backward(d_acc2, d_w1, d_b1, d_acc1, filtered_inp, w1, B, T, C, OC);
-
-    // Accumulate gradients for the input (w2)
-    matmul_backward(d_filtered_inp, d_w2, d_b2, d_acc2, filtered_inp, w2, B, T, C, OC);
-
-    // Free intermediate buffers
-    cudaCheck(cudaFree(d_acc1));
-    cudaCheck(cudaFree(d_acc2));
-    cudaCheck(cudaFree(d_acc3));
 }
 
 void gelu_forward(float *out, const float *inp, int N)
@@ -1988,15 +1489,14 @@ typedef struct
     int vocab_size = 50257;        // vocab size, e.g. 50257
     int num_layers = 12;           // number of layers, e.g. 12
     int num_heads = 12;            // number of heads in attention, e.g. 12
-    int num_kv_heads = 6;          // attention_gqa
     int channels = 768;            // number of channels, e.g. 768
     int padded_vocab_size = 50304; // padded to e.g. %128==0, 50304
-    int num_experts = 4;           // No. of Experts in our MoE
-    int num_experts_per_token = 2; // No. of Active Experts for a given token
-} GPT2Config;
+    int num_kv_heads = 6;          // attention_gqa
+    float rope_theta = 10000.0;
+} LLamaConfig;
 
 // the parameters of the model
-#define NUM_PARAMETER_TENSORS 18 // (17-6)+1+6
+#define NUM_PARAMETER_TENSORS 17
 typedef struct
 {
     float *wte; // (V, C)
@@ -2009,68 +1509,40 @@ typedef struct
     float *attprojb; // (L, C)
     float *ln2w;     // (L, C)
     float *ln2b;     // (L, C)
-    /**
-     * Removed these six parameters (used in SwiGLU - FFN)
-     */
-    // float *fcw;      // (L, 4*C, C)
-    // float *fcb;      // (L, 4*C)
-    // float *fcw_g;    // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
-    // float *fcb_g;    // (L, 4*C)
-    // float *fcprojw;  // (L, C, 4*C)
-    // float *fcprojb;  // (L, C)
-    float *lnfw; // (C)
-    float *lnfb; // (C)
-                 /**
-                  * Adding Params for MoE Architecture
-                  */
-
-    float *moegw;    // (L, num_experts, dim) // Added for MoE architecture
-    float *moe_w1;   // (L, num_experts, 4*C, C)
-    float *moe_b1;   // (L, num_experts, 4*C)
-    float *moe_w2;   // (L, num_experts, 4*C, C) Added for gate Mechanism of SwiGLU Activation
-    float *moe_b2;   // (L, num_experts, 4*C)
-    float *moeprojw; // (L, num_experts, C, 4*C)
-    float *moeprojb; // (L, num_experts, C)
+    float *fcw;      // (L, 4*C, C)
+    float *fcb;      // (L, 4*C)
+    float *fcw_g;    // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
+    float *fcb_g;    // (L, 4*C)
+    float *fcprojw;  // (L, C, 4*C)
+    float *fcprojb;  // (L, C)
+    float *lnfw;     // (C)
+    float *lnfb;     // (C)
 } ParameterTensors;
 
-void fill_in_parameter_sizes(size_t *param_sizes, GPT2Config config)
+void fill_in_parameter_sizes(size_t *param_sizes, LLamaConfig config)
 {
     int Vp = config.padded_vocab_size;
     int C = config.channels;
     int maxT = config.max_seq_len;
     int L = config.num_layers;
-    int num_experts = config.num_experts;
-
     param_sizes[0] = Vp * C; // wte
     // param_sizes[1] = maxT * C;         // wpe   No need. Using RoPE
-    param_sizes[1] = L * C;           // ln1w
-    param_sizes[2] = L * C;           // ln1b
-    param_sizes[3] = L * (3 * C) * C; // qkvw
-    param_sizes[4] = L * (3 * C);     // qkvb
-    param_sizes[5] = L * C * C;       // attprojw
-    param_sizes[6] = L * C;           // attprojb
-    param_sizes[7] = L * C;           // ln2w
-    param_sizes[8] = L * C;           // ln2b
-
-    /**
-     * Removed these six parameters (used in SwiGLU - FFN)
-     */
-    // param_sizes[9] = L * (4 * C) * C;      // fcw
-    // param_sizes[10] = L * (4 * C);         // fcb
-    // param_sizes[11] = L * (4 * C) * C;     // fcw_g
-    // param_sizes[12] = L * (4 * C);         // fcb_g
-    // param_sizes[13] = L * C * (4 * C);     // fcprojw
-    // param_sizes[14] = L * C;               // fcprojb
-    param_sizes[9] = C;                    // lnfw
-    param_sizes[10] = C;                   // lnfb
-    param_sizes[11] = L * num_experts * C; // moeg
-
-    param_sizes[12] = L * num_experts * (4 * C) * C; // moe_w1
-    param_sizes[13] = L * num_experts * (4 * C);     // moe_b1
-    param_sizes[14] = L * num_experts * (4 * C) * C; // moe_w2
-    param_sizes[15] = L * num_experts * (4 * C);     // moe_b2
-    param_sizes[16] = L * num_experts * C * (4 * C); // moeprojw
-    param_sizes[17] = L * num_experts * C;           // moeprojb
+    param_sizes[1] = L * C;            // ln1w
+    param_sizes[2] = L * C;            // ln1b
+    param_sizes[3] = L * (3 * C) * C;  // qkvw
+    param_sizes[4] = L * (3 * C);      // qkvb
+    param_sizes[5] = L * C * C;        // attprojw
+    param_sizes[6] = L * C;            // attprojb
+    param_sizes[7] = L * C;            // ln2w
+    param_sizes[8] = L * C;            // ln2b
+    param_sizes[9] = L * (4 * C) * C;  // fcw
+    param_sizes[10] = L * (4 * C);     // fcb
+    param_sizes[11] = L * (4 * C) * C; // fcw_g
+    param_sizes[12] = L * (4 * C);     // fcb_g
+    param_sizes[13] = L * C * (4 * C); // fcprojw
+    param_sizes[14] = L * C;           // fcprojb
+    param_sizes[15] = C;               // lnfw
+    param_sizes[16] = C;               // lnfb
 }
 
 // allocate memory for the parameters and point the individual tensors to the right places
@@ -2096,18 +1568,10 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
     // assign all the tensors their place in the array
     // Added 2 new params for SwiGLU
     // Removed wpe because of RoPE
-
-    /**
-     * MoE Parameters
-     *
-     * Removed these parameters - `&params->fcw, &params->fcb, &params->fcw_g, &params->fcb_g, &params->fcprojw, &params->fcprojb`
-     * Added these parameters - `&params->moegw, &params->moe_w1, &params->moe_b1, &params->moe_w2, &params->moe_b2, &params->moeprojw, &params->moeprojb`
-     */
     float **ptrs[] = {
         &params->wte, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
-        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b,
-        &params->lnfw, &params->lnfb,
-        &params->moegw, &params->moe_w1, &params->moe_b1, &params->moe_w2, &params->moe_b2, &params->moeprojw, &params->moeprojb};
+        &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb, &params->fcw_g, &params->fcb_g,
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb};
     float *params_memory_iterator = params_memory;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
     {
@@ -2117,7 +1581,7 @@ float *malloc_and_point_parameters(ParameterTensors *params, size_t *param_sizes
     return params_memory;
 }
 
-#define NUM_ACTIVATION_TENSORS 22 // Added for moe_gate (18-4)+1+2+1+2+2
+#define NUM_ACTIVATION_TENSORS 18
 typedef struct
 {
     float *encoded;  // (B, T, C)
@@ -2134,15 +1598,12 @@ typedef struct
     float *ln2;       // (L, B, T, C)
     // float *ln2_mean;   // (L, B, T)
     // float *ln2_rstd;   // (L, B, T)
-    /**
-     * Simple FFN (SwiGLU) Activations Removed.
-     */
-    // float *fch;        // (L, B, T, 4*C)
-    // float *fch_glu;    // (L, B, T, 4*C)
-    // float *fch_swiglu; // (L, B, T, 4*C)
-    // float *fcproj;     // (L, B, T, C)
-    float *residual3; // (L, B, T, C)
-    float *lnf;       // (B, T, C)
+    float *fch;        // (L, B, T, 4*C)
+    float *fch_glu;    // (L, B, T, 4*C)
+    float *fch_swiglu; // (L, B, T, 4*C)
+    float *fcproj;     // (L, B, T, C)
+    float *residual3;  // (L, B, T, C)
+    float *lnf;        // (B, T, C)
     // float *lnf_mean;   // (B, T)
     // float *lnf_rstd;   // (B, T)
 
@@ -2155,30 +1616,14 @@ typedef struct
     // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
     // (B, NH, T, T), and (B, T, V) shaped tensors.
     float *output;
-
-    // adding more activations for MoE
-    float *moe_gate;     // (L, B, T, num_experts)
-    float *moe_topk_w;   // (L, B, T, num_experts_per_token)
-    float *moe_topk_ind; // (L, B, T, num_experts_per_token) // Changed it to float*
-    float *repeat_ln2;   // (L,B, num_experts_per_token, T, C)
-    float *moe_logits;   // (L,B, num_experts_per_token, T,C)
-    float *moe_output;   // (L,B, T, C)
-
-    float *swiglu_xW; // (L,B,num_experts_per_token, T, 4*C)
-    float *swiglu_xV; // (L,B,num_experts_per_token, T, 4*C)
-
 } ActivationTensors;
 
-void fill_in_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config)
+void fill_in_activation_sizes(size_t *act_sizes, int B, int T, LLamaConfig config)
 {
     size_t Vp = config.padded_vocab_size;
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    // MoE params
-    size_t num_experts = config.num_experts;
-    size_t num_experts_per_token = config.num_experts_per_token;
-
     act_sizes[0] = B * T * C;          // encoded
     act_sizes[1] = T * (C / (2 * NH)); // freq_cos  (seq_len * head_dim)
     act_sizes[2] = T * (C / (2 * NH)); // freq_sin
@@ -2193,44 +1638,28 @@ void fill_in_activation_sizes(size_t *act_sizes, int B, int T, GPT2Config config
     act_sizes[8] = L * B * T * C;      // ln2
     // act_sizes[9] = L * B * T;                            // ln2_mean
     // act_sizes[10] = L * B * T;                           // ln2_rstd
-    /**
-     * Removed Acts Sizes
-     */
-    // act_sizes[9] = L * B * T * 4 * C;  // fch
-    // act_sizes[10] = L * B * T * 4 * C; // fch_glu
-    // act_sizes[11] = L * B * T * 4 * C; // fch_swiglu
-    // act_sizes[12] = L * B * T * C;     // fcproj
-    act_sizes[9] = L * B * T * C; // residual3
-    act_sizes[10] = B * T * C;    // lnf
+    act_sizes[9] = L * B * T * 4 * C;  // fch
+    act_sizes[10] = L * B * T * 4 * C; // fch_glu
+    act_sizes[11] = L * B * T * 4 * C; // fch_swiglu
+    act_sizes[12] = L * B * T * C;     // fcproj
+    act_sizes[13] = L * B * T * C;     // residual3
+    act_sizes[14] = B * T * C;         // lnf
     // act_sizes[17] = B * T;                               // lnf_mean
     // act_sizes[18] = B * T;                               // lnf_rstd
-    act_sizes[11] = B * T;                               // losses
-    act_sizes[12] = L * B * T * 3 * C;                   // qkvr
-    act_sizes[13] = B * T * max(3 * C, max(NH * T, Vp)); // output / scratch
-
-    // Activations for MoE
-    act_sizes[14] = L * B * T * num_experts;                   // gate-layer accumulate
-    act_sizes[15] = L * B * T * num_experts_per_token;         // topk_expert weights (softmaxized)
-    act_sizes[16] = L * B * T * num_experts_per_token;         // topk_expert indices
-    act_sizes[17] = L * B * num_experts_per_token * T * C;     // repeat_interleave on dim=0 for x
-    act_sizes[18] = L * B * num_experts_per_token * T * C;     // moe_logits after applying every moe_expert
-    act_sizes[19] = L * B * T * C;                             // moe_output (obtained by refactoring the logits #(B,num_experts_per_token, T,C) -> (B,T,C)
-    act_sizes[20] = L * B * num_experts_per_token * T * 4 * C; // swiglu_xw
-    act_sizes[21] = L * B * num_experts_per_token * T * 4 * C; // swiglu_xV
+    act_sizes[15] = B * T;                               // losses
+    act_sizes[16] = L * B * T * 3 * C;                   // qkvr
+    act_sizes[17] = B * T * max(3 * C, max(NH * T, Vp)); // output / scratch
 }
 
 // Backward pass is conceptually quite different from forward, because we can discard
 // the activations of a layer as soon as we're done with it. This lets us aggressively
 // reuse memory, so that we need far fewer tensors for backward state.
-#define NUM_BACKWARD_TENSORS 5 // Adding for MoE Backward Tensors
+#define NUM_BACKWARD_TENSORS 3
 typedef struct
 {
-    float *bt4c;               // (B, T, 4*C)
-    float *preatt;             // (B, NH, T, T)
-    float *residual3;          // (B, T, C)
-    float *moe_logits;         // (B, num_experts, T, C)
-    float *moe_expert_weights; // (B, T, num_experts)
-
+    float *bt4c;      // (B, T, 4*C)
+    float *preatt;    // (B, NH, T, T)
+    float *residual3; // (B, T, C)
     /**
      * NO NEED of accumulating these gradients.
      *
@@ -2246,17 +1675,13 @@ typedef struct
 
 } GradActTensors;
 
-void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T, GPT2Config config)
+void fill_in_grad_act_sizes(size_t *act_sizes, int B, int T, LLamaConfig config)
 {
     size_t NH = config.num_heads;
     size_t C = config.channels;
-    size_t num_experts_per_token = config.num_experts_per_token;
-
-    act_sizes[0] = B * T * 4 * C;                     // bt4c
-    act_sizes[1] = B * NH * T * T;                    // preatt
-    act_sizes[2] = B * T * C;                         // residual3
-    act_sizes[3] = B * num_experts_per_token * T * C; // moe_logits
-    act_sizes[4] = B * T * num_experts_per_token;     // moe_expert_weights
+    act_sizes[0] = B * T * 4 * C;  // bt4c
+    act_sizes[1] = B * NH * T * T; // preatt
+    act_sizes[2] = B * T * C;      // residual3
 }
 
 float *malloc_and_point(float **targets[], const size_t *act_sizes, int n)
@@ -2279,18 +1704,11 @@ float *malloc_and_point(float **targets[], const size_t *act_sizes, int n)
 
 float *malloc_and_point_activations(ActivationTensors *acts, const size_t *act_sizes)
 {
-    /**
-     * Changes due to MoE
-     *
-     * Removed -  `&acts->fch, &acts->fch_glu, &acts->fch_swiglu, &acts->fcproj`
-     * Added - `&acts->moe_gate, &acts->moe_topk_w, &acts->moe_topk_ind, &acts->repeat_ln2, &acts->moe_logits, &acts->moe_output`
-     */
     float **ptrs[] = {
-        &acts->encoded, &acts->freq_cos, &acts->freq_sin & acts->ln1, &acts->atty,
+        &acts->encoded, &acts->freq_cos, &acts->freq_sin, &acts->ln1, &acts->atty,
         &acts->att, &acts->attproj, &acts->residual2, &acts->ln2,
-        &acts->residual3, &acts->lnf,
-        &acts->losses, &acts->qkvr, &acts->output,
-        &acts->moe_gate, &acts->moe_topk_w, &acts->moe_topk_ind, &acts->repeat_ln2, &acts->moe_logits, &acts->moe_output, &acts->swiglu_xW, &acts->swiglu_xV};
+        &acts->fch, &acts->fch_glu, &acts->fch_swiglu, &acts->fcproj, &acts->residual3, &acts->lnf,
+        &acts->losses, &acts->qkvr, &acts->output};
     return malloc_and_point(ptrs, act_sizes, NUM_ACTIVATION_TENSORS);
 }
 
@@ -2300,15 +1718,13 @@ float *malloc_and_point_backward(GradActTensors *acts, const size_t *act_sizes)
         &acts->bt4c,
         &acts->preatt,
         &acts->residual3,
-        &acts->moe_logits,
-        &acts->moe_expert_weights,
     };
     return malloc_and_point(ptrs, act_sizes, NUM_BACKWARD_TENSORS);
 }
 
 typedef struct
 {
-    GPT2Config config;
+    LLamaConfig config;
     // the weights of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
@@ -2336,10 +1752,11 @@ typedef struct
     int *targets;      // the target tokens for the current forward pass
     float mean_loss;   // after a forward pass with targets, will be populated with the mean loss
     float *cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-} GPT2;
+} LLaMA3;
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
+void gpt2_build_from_checkpoint(LLaMA3 *model, const char *checkpoint_path)
 {
+
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
@@ -2411,7 +1828,7 @@ void xavier_initialization(float *param_values, size_t size, size_t fan_in, size
     }
 }
 
-void load_model_params(GPT2 *model)
+void load_model_params(LLaMA3 *model)
 {
     // Initialize model configuration and parameters from given param_values
     model->config.max_seq_len = 1024;
@@ -2420,9 +1837,8 @@ void load_model_params(GPT2 *model)
     model->config.num_heads = 12;
     model->config.channels = 768;
     model->config.padded_vocab_size = 50304;
+    model->config.rope_theta = 10000.0;
     model->config.num_kv_heads = 6;
-    model->config.num_experts = 4;
-    model->config.num_experts_per_token = 2;
 
     // allocate space for all the parameters and point them to the right places
     fill_in_parameter_sizes(model->param_sizes, model->config);
@@ -2450,7 +1866,7 @@ void load_model_params(GPT2 *model)
 
     // Initialize parameter values on the CPU
     size_t offset = 0;
-    for (size_t i = 0; i <= NUM_PARAMETER_TENSORS; i++)
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++)
     {
         size_t size = model->param_sizes[i];
         size_t fan_in = (i == 0) ? model->config.padded_vocab_size : model->config.channels;
@@ -2477,18 +1893,7 @@ void load_model_params(GPT2 *model)
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-/*
- * HELPER method for converting from `float* moe_topk_ind` ->  `int *top_indices`
- */
-// Function to convert float array to int array
-void convertFloatToInt(const float *floatArray, int *intArray, size_t size)
-{
-    for (size_t i = 0; i < size; ++i)
-    {
-        intArray[i] = static_cast<int>(floatArray[i]);
-    }
-}
-void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
+void llama3_forward(LLaMA3 *model, int *inputs, int *targets, int B, int T)
 {
     // targets are optional and could be NULL
 
@@ -2504,11 +1909,9 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
     int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
-    int num_kv_heads = model->config.num_kv_heads;
     int C = model->config.channels;
-    // For MoE
-    int num_experts = model->config.num_experts;
-    int num_experts_per_token = model->config.num_experts_per_token;
+    int num_kv_heads = model->config.num_kv_heads;
+    float rope_theta = model->config.rope_theta;
 
     // validate inputs, all indices must be in the range [0, V)
     for (int i = 0; i < B * T; i++)
@@ -2558,12 +1961,6 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
     {
         cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     }
-    /**
-     * Just a simple overhead of Converting from float to int (TODO: Must come up with an efficient way to do this)
-     */
-    // size_t = L * B * T * num_experts_per_token;
-    // int *intArray;
-    // cudaMallocManaged(&intArray, size * sizeof(int));
 
     // forward pass
     ParameterTensors params = model->params; // for brevity
@@ -2573,8 +1970,8 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
     // TODO: Extract them from activations (if needed)
     float *freq_cos = acts.freq_cos;
     float *freq_sin = acts.freq_sin;
-    encoder_forward(acts.encoded, model->inputs, params.wte, B, T, C);    // encoding goes into residual[0]
-    precompute_freqs_cis(freq_cos, freq_sin, ((C / NH) / 2), T, 10000.0); // theta = 10000.0
+    encoder_forward(acts.encoded, model->inputs, params.wte, B, T, C);       // encoding goes into residual[0]
+    precompute_freqs_cis(freq_cos, freq_sin, ((C / NH) / 2), T, rope_theta); // rope_theta = 10000.0
 
     for (int l = 0; l < L; l++)
     {
@@ -2590,23 +1987,12 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
         float *l_attprojb = params.attprojb + l * C;
         float *l_ln2w = params.ln2w + l * C;
         float *l_ln2b = params.ln2b + l * C;
-
-        // REMOVED - Feed-Forward Params
-        // float *l_fcw = params.fcw + l * 4 * C * C;
-        // float *l_fcb = params.fcb + l * 4 * C;
-        // float *l_fcw_g = params.fcw_g + l * 4 * C * C; // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
-        // float *l_fcb_g = params.fcb_g + l * 4 * C;     // (L, 4*C)
-        // float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-        // float *l_fcprojb = params.fcprojb + l * C;
-
-        // Adding Params for MoE
-        float *l_moegw = params.moegw + l * num_experts * C;
-        float *l_moe_w1 = params.moe_w1 + l * num_experts * 4 * C * C;
-        float *l_moe_b1 = params.moe_b1 + l * num_experts * 4 * C;
-        float *l_moe_w2 = params.moe_w2 + l * num_experts * 4 * C * C;
-        float *l_moe_b2 = params.moe_b2 + l * num_experts * 4 * C;
-        float *l_moeprojw = params.moeprojw + l * num_experts * C * 4 * C;
-        float *l_moeprojb = params.moeprojb + l * num_experts * C;
+        float *l_fcw = params.fcw + l * 4 * C * C;
+        float *l_fcb = params.fcb + l * 4 * C;
+        float *l_fcw_g = params.fcw_g + l * 4 * C * C; // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
+        float *l_fcb_g = params.fcb_g + l * 4 * C;     // (L, 4*C)
+        float *l_fcprojw = params.fcprojw + l * C * 4 * C;
+        float *l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
         float *l_ln1 = acts.ln1 + l * B * T * C;
@@ -2620,27 +2006,14 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
         float *l_ln2 = acts.ln2 + l * B * T * C;
         // float *l_ln2_mean = acts.ln2_mean + l * B * T;
         // float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-
-        // REMOVED - Feed-Forward Acts
-        // float *l_fch = acts.fch + l * B * T * 4 * C;
-        // float *l_fch_glu = acts.fch_glu + l * B * T * 4 * C;
-        // float *l_fch_swiglu = acts.fch_swiglu + l * B * T * 4 * C;
-        // float *l_fcproj = acts.fcproj + l * B * T * C;
+        float *l_fch = acts.fch + l * B * T * 4 * C;
+        float *l_fch_glu = acts.fch_glu + l * B * T * 4 * C;
+        float *l_fch_swiglu = acts.fch_swiglu + l * B * T * 4 * C;
+        float *l_fcproj = acts.fcproj + l * B * T * C;
         float *l_residual3 = acts.residual3 + l * B * T * C;
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         float *scratch = acts.output;
-
-        // Adding acts for MoE
-        float *l_moe_gate = acts.moe_gate + l * B * T * num_experts;
-        float *l_moe_topk_w = acts.moe_topk_w + l * B * T * num_experts_per_token;
-        int *l_moe_topk_ind = acts.moe_topk_ind + l * B * T * num_experts_per_token;
-        float *l_repeat_ln2 = acts.repeat_ln2 + l * B * num_experts_per_token * T * C;
-        float *l_moe_logits = acts.moe_logits + l * B * num_experts_per_token * T * C;
-        float *l_moe_output = acts.moe_output + l * B * T * C;
-
-        float *l_swiglu_xw = acts.swiglu_xW + l * B * num_experts_per_token * T * 4 * C;
-        float *l_swiglu_xv = acts.swiglu_xV + l * B * num_experts_per_token * T * 4 * C;
 
         // now do the forward pass
         rmsnorm_forward(l_ln1, residual, l_ln1w, l_ln1b, B, T, C);
@@ -2649,26 +2022,11 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B * T * C);
         rmsnorm_forward(l_ln2, l_residual2, l_ln2w, l_ln2b, B, T, C);
-        /**
-         * MoE addition starts
-         */
-        matmul_forward(l_moe_gate, l_ln2, l_moegw, NULL, B, T, C, num_experts);
-        topk_softmax_fused_forward(l_moe_topk_w, l_moe_topk_ind, l_moe_gate, B, T, num_experts, num_experts_per_token);
-        repeat_interleave_dim0_forward(l_repeat_ln2, l_ln2, B, T, C, num_experts_per_token);
-        forward_with_experts(l_moe_logits, l_moe_w1, l_moe_b1, l_moe_w2, l_moe_b2, l_moeprojw, l_moeprojb, l_repeat_ln2, l_moe_topk_ind, l_swiglu_xw, l_swiglu_xv, B, T, C, num_experts);
-        experts_weighted_sum_forward(l_moe_output, l_moe_logits, l_moe_topk_w, B, T, C, num_experts_per_token);
-
-        /**
-         * Till here
-         */
-
-        // Removed: feed-forward layer
-        // matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);         // xW
-        // matmul_forward(l_fch_glu, l_ln2, l_fcw_g, l_fcb_g, B, T, C, 4 * C); // xV
-        // swiglu_forward(l_fch_swiglu, l_fch, l_fch_glu, B * T * 4 * C);
-        // matmul_forward(l_fcproj, l_fch_swiglu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
-
-        residual_forward(l_residual3, l_residual2, l_moe_output, B * T * C);
+        matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C);         // xW
+        matmul_forward(l_fch_glu, l_ln2, l_fcw_g, l_fcb_g, B, T, C, 4 * C); // xV
+        swiglu_forward(l_fch_swiglu, l_fch, l_fch_glu, B * T * 4 * C);
+        matmul_forward(l_fcproj, l_fch_swiglu, l_fcprojw, l_fcprojb, B, T, 4 * C, C);
+        residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C);
     }
 
     residual = acts.residual3 + (L - 1) * B * T * C; // last residual is in residual3
@@ -2699,7 +2057,7 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T)
     }
 }
 
-void gpt2_zero_grad(GPT2 *model)
+void llama3_zero_grad(LLaMA3 *model)
 {
     if (model->grads_acts_memory != NULL)
     {
@@ -2711,8 +2069,9 @@ void gpt2_zero_grad(GPT2 *model)
     }
 }
 
-void gpt2_backward(GPT2 *model)
+void llama3_backward(LLaMA3 *model)
 {
+
     // double check we forwarded previously, with targets
     if (model->mean_loss == -1.0f)
     {
@@ -2729,7 +2088,7 @@ void gpt2_backward(GPT2 *model)
         // we're going to be clever for the activations backward pass. we don't need to exactly
         // mirror the forward pass acrtivations and we will save memory.
         size_t bw_act_sizes[NUM_ACTIVATION_TENSORS];
-        GPT2Config cfg = model->config;
+        LLamaConfig cfg = model->config;
         cfg.num_layers = 1; // copy the configuration but override number of layers to 1
         fill_in_grad_act_sizes(bw_act_sizes, model->batch_size, model->seq_len, cfg);
         // count up and allocate the space
@@ -2741,21 +2100,17 @@ void gpt2_backward(GPT2 *model)
         }
         printf("allocated %zu MiB for activation gradients\n", (model->num_grad_acts * sizeof(float)) >> 20);
         // init gradients of parameters and activations to zero
-        gpt2_zero_grad(model);
+        llama3_zero_grad(model);
     }
 
     // convenience shortcuts
     int B = model->batch_size;
     int T = model->seq_len;
-    int C = model->config.channels;
-    int V = model->config.vocab_size;
     int Vp = model->config.padded_vocab_size;
     int L = model->config.num_layers;
     int NH = model->config.num_heads;
+    int C = model->config.channels;
     int num_kv_heads = model->config.num_kv_heads;
-    // For MoE
-    int num_experts = model->config.num_experts;
-    int num_experts_per_token = model->config.num_experts_per_token;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -2789,18 +2144,9 @@ void gpt2_backward(GPT2 *model)
         float *l_qkvw = params.qkvw + l * 3 * C * C;
         float *l_attprojw = params.attprojw + l * C * C;
         float *l_ln2w = params.ln2w + l * C;
-        // float *l_fcw = params.fcw + l * 4 * C * C;
-        // float *l_fcw_g = params.fcw_g + l * 4 * C * C;
-        // float *l_fcprojw = params.fcprojw + l * C * 4 * C;
-        /** Added for MoE */
-        float *l_moegw = params.moegw + l * num_experts * C;
-        float *l_moe_w1 = params.moe_w1 + l * num_experts * 4 * C * C;
-        float *l_moe_b1 = params.moe_b1 + l * num_experts * 4 * C;
-        float *l_moe_w2 = params.moe_w2 + l * num_experts * 4 * C * C;
-        float *l_moe_b2 = params.moe_b2 + l * num_experts * 4 * C;
-        float *l_moeprojw = params.moeprojw + l * num_experts * C * 4 * C;
-        float *l_moeprojb = params.moeprojb + l * num_experts * C;
-
+        float *l_fcw = params.fcw + l * 4 * C * C;
+        float *l_fcw_g = params.fcw_g + l * 4 * C * C;
+        float *l_fcprojw = params.fcprojw + l * C * 4 * C;
         // get the pointers of the gradients of the weights for this layer
         float *dl_ln1w = grads.ln1w + l * C;
         float *dl_ln1b = grads.ln1b + l * C;
@@ -2810,23 +2156,12 @@ void gpt2_backward(GPT2 *model)
         float *dl_attprojb = grads.attprojb + l * C;
         float *dl_ln2w = grads.ln2w + l * C;
         float *dl_ln2b = grads.ln2b + l * C;
-        /**
-         * REMOVED- Because of MoE Addition
-         */
-        // float *dl_fcw = grads.fcw + l * 4 * C * C;
-        // float *dl_fcb = grads.fcb + l * 4 * C;
-        // float *dl_fcw_g = grads.fcw_g + l * 4 * C * C; // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
-        // float *dl_fcb_g = grads.fcb_g + l * 4 * C;     // (L, 4*C)
-        // float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
-        // float *dl_fcprojb = grads.fcprojb + l * C;
-        float *dl_moegw = grads.moegw + l * num_experts * C;
-        float *dl_moe_w1 = grads.moe_w1 + l * num_experts * 4 * C * C;
-        float *dl_moe_b1 = grads.moe_b1 + l * num_experts * 4 * C;
-        float *dl_moe_w2 = grads.moe_w2 + l * num_experts * 4 * C * C;
-        float *dl_moe_b2 = grads.moe_b2 + l * num_experts * 4 * C;
-        float *dl_moeprojw = grads.moeprojw + l * num_experts * C * 4 * C;
-        float *dl_moeprojb = grads.moeprojb + l * num_experts * C;
-
+        float *dl_fcw = grads.fcw + l * 4 * C * C;
+        float *dl_fcb = grads.fcb + l * 4 * C;
+        float *dl_fcw_g = grads.fcw_g + l * 4 * C * C; // (L, 4*C, C) Added for gate Mechanism of SwiGLU Activation
+        float *dl_fcb_g = grads.fcb_g + l * 4 * C;     // (L, 4*C)
+        float *dl_fcprojw = grads.fcprojw + l * C * 4 * C;
+        float *dl_fcprojb = grads.fcprojb + l * C;
         // get the pointers of the activations for this layer
         float *l_ln1 = acts.ln1 + l * B * T * C;
         // float *l_ln1_mean = acts.ln1_mean + l * B * T;
@@ -2838,23 +2173,9 @@ void gpt2_backward(GPT2 *model)
         float *l_ln2 = acts.ln2 + l * B * T * C;
         // float *l_ln2_mean = acts.ln2_mean + l * B * T;
         // float *l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        /**
-         * Removed due to MoE
-         */
-        // float *l_fch = acts.fch + l * B * T * 4 * C;
-        // float *l_fch_glu = acts.fch_glu + l * B * T * 4 * C;
-        // float *l_fch_swiglu = acts.fch_swiglu + l * B * T * 4 * C;
-        /** Added due to MoE */
-        float *l_moe_gate = acts.moe_gate + l * B * T * num_experts;
-        float *l_moe_topk_w = acts.moe_topk_w + l * B * T * num_experts_per_token;
-        int *l_moe_topk_ind = acts.moe_topk_ind + l * B * T * num_experts_per_token;
-        float *l_repeat_ln2 = acts.repeat_ln2 + l * B * num_experts_per_token * T * C;
-        float *l_moe_logits = acts.moe_logits + l * B * num_experts_per_token * T * C;
-        float *l_moe_output = acts.moe_output + l * B * T * C;
-
-        float *l_swiglu_xw = acts.swiglu_xW + B * num_experts_per_token * T * 4 * C;
-        float *l_swiglu_xv = acts.swiglu_xV + B * num_experts_per_token * T * 4 * C;
-
+        float *l_fch = acts.fch + l * B * T * 4 * C;
+        float *l_fch_glu = acts.fch_glu + l * B * T * 4 * C;
+        float *l_fch_swiglu = acts.fch_swiglu + l * B * T * 4 * C;
         // get the pointers of the gradients of the activations for this layer
         // notice that there is no l *, because we just have a single copy, and keep
         // re-using this memory in every Transformer block as we calculate backward pass
@@ -2864,37 +2185,21 @@ void gpt2_backward(GPT2 *model)
         float *dl_btc = acts.lnf;
         float *dl_bt4c = grads_acts.bt4c;
         float *dl_preatt = grads_acts.preatt;
-        float *dl_moe_logits = grads_acts.moe_logits;
-        float *dl_moe_expert_weights = grads_acts.moe_expert_weights;
-        // float *dl_moe_gate = grads_acts.moe_gate;
 
         // re-use scratch buffer of the forward pass
         float *scratch = acts.output;
 
-        /** MoE Layer Backward-Pass */
-
         // backprop this layer
-
-        experts_weighted_sum_backward(dl_moe_logits, dl_moe_expert_weights, l_moe_output, l_moe_logits, l_moe_topk_w, dresidual, B, T, C, num_experts_per_token);
-        forward_with_experts_backward(dl_moe_logits, dl_moe_w1, dl_moe_b1, dl_moe_w2, dl_moe_b2, dl_moeprojw, dl_moeprojb,
-                                      dl_moe_logits, l_moe_w1, l_moe_b1, l_moe_w2, l_moe_b2, l_moeprojw, l_moeprojb,
-                                      l_repeat_ln2, l_moe_topk_ind, l_swiglu_xw, l_swiglu_xv,
-                                      B, T, C, num_experts);
-        repeat_interleave_dim0_backward(dl_btc, dl_moe_logits, B, T, C, num_experts_per_token);
-        topk_softmax_fused_backward(dl_moe_expert_weights, dl_moe_expert_weights, l_moe_topk_ind, l_moe_topk_w, B, T, num_experts, num_experts_per_token);
-        matmul_backward(dl_btc, dl_moegw, NULL, dl_btc, l_ln2, l_moegw, B, T, C, num_experts);
-
-        // matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, B, T, 4 * C, C);
-        // swiglu_backward(dl_bt4c, l_fch, l_fch_glu, dl_bt4c, l_fcw, l_fcw_g, B * T * 4 * C);
-        // matmul_backward(dl_btc, dl_fcw_g, dl_fcb_g, dl_bt4c, l_ln2, l_fcw_g, B, T, C, 4 * C);
-        // matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
-
+        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_swiglu, l_fcprojw, B, T, 4 * C, C);
+        swiglu_backward(dl_bt4c, l_fch, l_fch_glu, dl_bt4c, l_fcw, l_fcw_g, B * T * 4 * C);
+        matmul_backward(dl_btc, dl_fcw_g, dl_fcb_g, dl_bt4c, l_ln2, l_fcw_g, B, T, C, 4 * C);
+        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, B, T, C, 4 * C);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         rmsnorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_btc, l_residual2, l_ln2w, B, T, C);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C);
         // we more B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         float *buffer_a = l_atty;
-        float *buffer_b = dl_bt4c; // this is B x T x 4C, so even larger than what we need
+        float *buffer_b = l_fch; // this is B x T x 4C, so even larger than what we need
 
         attention_backward_gqa(dl_bt4c, buffer_b, dl_preatt, scratch, buffer_a, dl_btc, freq_cos, freq_sin, l_qkvr, l_att, B, T, C, NH, num_kv_heads);
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, B, T, C, 3 * C);
@@ -2905,7 +2210,7 @@ void gpt2_backward(GPT2 *model)
     encoder_backward(grads.wte, dresidual, model->inputs, B, T, C);
 }
 
-void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t)
+void llama3_update(LLaMA3 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t)
 {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
 
@@ -2930,7 +2235,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
     cudaCheck(cudaGetLastError());
 }
 
-void gpt2_free(GPT2 *model)
+void llama3_free(LLaMA3 *model)
 {
     cudaCheck(cudaFree(model->params_memory));
     cudaCheck(cudaFree(model->grads_memory));
@@ -3057,6 +2362,7 @@ void error_usage()
 // main training loop
 int main(int argc, char *argv[])
 {
+
     // read in the (optional) command line arguments
     const char *train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char *val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
@@ -3160,17 +2466,17 @@ int main(int argc, char *argv[])
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
-    GPT2 model;
+    LLaMA3 model;
     // gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    /**
+     * Not loading pre_trained model weights. Randomly Initializing model weights using Xavier Initialization
+     */
     load_model_params(&model);
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
     printf("| num_layers L          | %-50d |\n", model.config.num_layers);
     printf("| num_heads NH          | %-50d |\n", model.config.num_heads);
-    printf("| num_kv_heads          | %-50d |\n", model.config.num_kv_heads);
-    printf("| num_experts           | %-50d |\n", model.config.num_experts);
-    printf("| num_experts_per_token | %-50d |\n", model.config.num_experts_per_token);
     printf("| channels C            | %-50d |\n", model.config.channels);
     printf("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -3220,7 +2526,7 @@ int main(int argc, char *argv[])
             for (int i = 0; i < val_num_batches; i++)
             {
                 dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
+                llama3_forward(&model, val_loader.inputs, val_loader.targets, B, T);
                 val_loss += model.mean_loss;
             }
             val_loss /= val_num_batches;
@@ -3244,7 +2550,7 @@ int main(int argc, char *argv[])
                 // we re-calculate the forward pass for all of (B,T) positions from scratch
                 // but the inference here is just for sanity checking anyway
                 // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
+                llama3_forward(&model, gen_tokens, NULL, B, T);
                 // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
                 // we're in principle running B "inference streams" in parallel here
                 // only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
@@ -3283,10 +2589,10 @@ int main(int argc, char *argv[])
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
+        llama3_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+        llama3_zero_grad(&model);
+        llama3_backward(&model);
+        llama3_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step + 1);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -3302,7 +2608,7 @@ int main(int argc, char *argv[])
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
     tokenizer_free(&tokenizer);
-    gpt2_free(&model);
+    llama3_free(&model);
     free(cpu_logits);
     free(gen_tokens);
     cublasCheck(cublasDestroy(cublas_handle));

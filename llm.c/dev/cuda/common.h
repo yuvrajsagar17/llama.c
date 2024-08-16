@@ -8,13 +8,16 @@
 #define WARP_SIZE 32U
 extern cudaDeviceProp deviceProp;
 
-template<class T>
-__host__ __device__ T ceil_div(T dividend, T divisor) {
-    return (dividend + divisor-1) / divisor;
+template <class T>
+__host__ __device__ T ceil_div(T dividend, T divisor)
+{
+    return (dividend + divisor - 1) / divisor;
 }
 
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+__device__ float warpReduceSum(float val)
+{
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
@@ -24,10 +27,11 @@ __device__ float warpReduceSum(float val) {
 // uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
 // the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
 // but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
-using reduction_func_t = float (*) (float);
+using reduction_func_t = float (*)(float);
 
-template<reduction_func_t warp_reduction>
-__device__ inline float blockReduce(float val, bool final_sync, float out_of_bounds) {
+template <reduction_func_t warp_reduction>
+__device__ inline float blockReduce(float val, bool final_sync, float out_of_bounds)
+{
     // two reductions of up to 1024 threads:
     // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
     __shared__ float shared_val[WARP_SIZE];
@@ -36,20 +40,25 @@ __device__ inline float blockReduce(float val, bool final_sync, float out_of_bou
     const int num_warps = blockDim.x / WARP_SIZE;
 
     float warp_val = warp_reduction(val);
-    if (lane_id == 0) { shared_val[warp_id] = warp_val; }
+    if (lane_id == 0)
+    {
+        shared_val[warp_id] = warp_val;
+    }
     __syncthreads();
     warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
     float block_val = warp_reduction(warp_val);
 
-    if (final_sync) {
+    if (final_sync)
+    {
         __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
     }
     return block_val;
 }
 
 // Helper function to call blockReduce with default arguments
-template<reduction_func_t warp_reduction>
-__device__ inline float blockReduce(float val) {
+template <reduction_func_t warp_reduction>
+__device__ inline float blockReduce(float val)
+{
     return blockReduce<warp_reduction>(val, false, 0.0f);
 }
 
@@ -57,8 +66,10 @@ __device__ inline float blockReduce(float val) {
 // checking utils
 
 // CUDA error checking
-void cuda_check(cudaError_t error, const char *file, int line) {
-    if (error != cudaSuccess) {
+void cuda_check(cudaError_t error, const char *file, int line)
+{
+    if (error != cudaSuccess)
+    {
         printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
                cudaGetErrorString(error));
         exit(EXIT_FAILURE);
@@ -69,12 +80,16 @@ void cuda_check(cudaError_t error, const char *file, int line) {
 // cuBLAS error checking
 void cublasCheck(cublasStatus_t status, const char *file, int line)
 {
-    if (status != CUBLAS_STATUS_SUCCESS) {
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
         printf("[cuBLAS ERROR]: %d %s %d\n", status, file, line);
         exit(EXIT_FAILURE);
     }
 }
-#define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
+#define cublasCheck(status)                        \
+    {                                              \
+        cublasCheck((status), __FILE__, __LINE__); \
+    }
 
 // ----------------------------------------------------------------------------
 // cuBLAS setup
@@ -82,14 +97,14 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 
 // cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
-static void* cublaslt_workspace = NULL;
+static void *cublaslt_workspace = NULL;
 static cublasComputeType_t cublas_compute_type;
 cublasHandle_t cublas_handle;
 cublasLtHandle_t cublaslt_handle;
 int cuda_arch_major = 0;
 int cuda_arch_minor = 0;
-int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
-int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch to fill up the GPU
+int cuda_num_SMs = 0;        // for persistent threads where we want 1 threadblock per SM
+int cuda_threads_per_SM = 0; // needed to calculate how many blocks to launch to fill up the GPU
 
 // ----------------------------------------------------------------------------
 // to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
@@ -105,39 +120,48 @@ int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch
 // This is a bit similar to the use of float4 in the case of 32-bit floats, but
 // supports arbitrary precision.
 
-template<class ElementType>
-struct alignas(16) Packed128 {
+template <class ElementType>
+struct alignas(16) Packed128
+{
     // Note: = default implicitly generates a __device__ function, but explicitly
     // adding __device__ causes a lot of warnings.
     Packed128() = default;
-    __device__ explicit Packed128(int4 bits) {
+    __device__ explicit Packed128(int4 bits)
+    {
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&payload, &bits, sizeof(bits));
     }
 
-    __device__  static Packed128 constant(ElementType value) {
+    __device__ static Packed128 constant(ElementType value)
+    {
         Packed128 result;
-        for(int k = 0; k < size; ++k) {
+        for (int k = 0; k < size; ++k)
+        {
             result.payload[k] = value;
         }
         return result;
     }
 
-    __device__ static Packed128 zeros() {
+    __device__ static Packed128 zeros()
+    {
         return constant(0);
     }
 
-    __device__ static Packed128 ones() {
+    __device__ static Packed128 ones()
+    {
         return constant(1);
     }
 
-    __device__ ElementType& operator[](int index) {
+    __device__ ElementType &operator[](int index)
+    {
         return payload[index];
     }
-    __device__ const ElementType& operator[](int index) const {
+    __device__ const ElementType &operator[](int index) const
+    {
         return payload[index];
     }
-    __device__ int4 get_bits() const {
+    __device__ int4 get_bits() const
+    {
         int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&bits, &payload, sizeof(bits));
@@ -153,29 +177,34 @@ struct alignas(16) Packed128 {
 typedef Packed128<float> f128;
 
 // load a Packed128 from an aligned memory address
-template<class ElementType>
-__device__ Packed128<ElementType> load128(const ElementType* address) {
-    return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+template <class ElementType>
+__device__ Packed128<ElementType> load128(const ElementType *address)
+{
+    return Packed128<ElementType>{*reinterpret_cast<const int4 *>(address)};
 }
 // load a Packed128 from an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ Packed128<ElementType> load128cs(const ElementType* address) {
-    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+template <class ElementType>
+__device__ Packed128<ElementType> load128cs(const ElementType *address)
+{
+    return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
 }
 // store a Packed128 to an aligned memory address
-template<class ElementType>
-__device__ void store128(ElementType* target, Packed128<ElementType> value) {
-    *reinterpret_cast<int4*>(target) = value.get_bits();
+template <class ElementType>
+__device__ void store128(ElementType *target, Packed128<ElementType> value)
+{
+    *reinterpret_cast<int4 *>(target) = value.get_bits();
 }
 // store a Packed128 to an aligned memory address with streaming cache hint
-template<class ElementType>
-__device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
-    __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+template <class ElementType>
+__device__ void store128cs(ElementType *target, Packed128<ElementType> value)
+{
+    __stcs(reinterpret_cast<int4 *>(target), value.get_bits());
 }
 // store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
-template<class ElementType>
-__device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
-    __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+template <class ElementType>
+__device__ void store128cg(ElementType *target, Packed128<ElementType> value)
+{
+    __stcg(reinterpret_cast<int4 *>(target), value.get_bits());
 }
 
 // ----------------------------------------------------------------------------
@@ -202,59 +231,68 @@ typedef float floatN;
 
 typedef Packed128<floatX> x128;
 
-
 // older nvcc does not provide __ldcs and __stcs for bfloat16, despite these actually just being unsigned shorts.
 // we need to be careful here to only define our own versions if none already exist, otherwise the compiler will
 // complain.
 // If not, you easily get "no viable overload" (for sm52) and "function already exists" (sm_80)
 #if defined(ENABLE_BF16) && (__CUDACC_VER_MAJOR__ < 12) && !((__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__))
-__device__ floatX __ldcs(const floatX* address) {
-    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short*>(address));
+__device__ floatX __ldcs(const floatX *address)
+{
+    unsigned short bf = __ldcs(reinterpret_cast<const unsigned short *>(address));
     return __nv_bfloat16_raw{bf};
 }
 
-__device__ void __stcs(floatX* address, floatX value) {
-    __stcs(reinterpret_cast<unsigned short*>(address), ((__nv_bfloat16_raw)value).x);
+__device__ void __stcs(floatX *address, floatX value)
+{
+    __stcs(reinterpret_cast<unsigned short *>(address), ((__nv_bfloat16_raw)value).x);
 }
 #endif
-
 
 // ----------------------------------------------------------------------------
 // random utils
 
-float* make_random_float_01(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (size_t i = 0; i < N; i++) {
+float *make_random_float_01(size_t N)
+{
+    float *arr = (float *)malloc(N * sizeof(float));
+    for (size_t i = 0; i < N; i++)
+    {
         arr[i] = ((float)rand() / RAND_MAX); // range 0..1
     }
     return arr;
 }
 
-float* make_random_float(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (size_t i = 0; i < N; i++) {
+float *make_random_float(size_t N)
+{
+    float *arr = (float *)malloc(N * sizeof(float));
+    for (size_t i = 0; i < N; i++)
+    {
         arr[i] = ((float)rand() / RAND_MAX) * 2.0 - 1.0; // range -1..1
     }
     return arr;
 }
 
-int* make_random_int(size_t N, int V) {
-    int* arr = (int*)malloc(N * sizeof(int));
-    for (size_t i = 0; i < N; i++) {
+int *make_random_int(size_t N, int V)
+{
+    int *arr = (int *)malloc(N * sizeof(int));
+    for (size_t i = 0; i < N; i++)
+    {
         arr[i] = rand() % V; // range 0..V-1
     }
     return arr;
 }
 
-float* make_zeros_float(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
+float *make_zeros_float(size_t N)
+{
+    float *arr = (float *)malloc(N * sizeof(float));
     memset(arr, 0, N * sizeof(float)); // all zero
     return arr;
 }
 
-float* make_ones_float(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (size_t i = 0; i < N; i++) {
+float *make_ones_float(size_t N)
+{
+    float *arr = (float *)malloc(N * sizeof(float));
+    for (size_t i = 0; i < N; i++)
+    {
         arr[i] = 1.0f;
     }
     return arr;
@@ -263,11 +301,13 @@ float* make_ones_float(size_t N) {
 // ----------------------------------------------------------------------------
 // testing and benchmarking utils
 
-template<class TargetType>
-[[nodiscard]] cudaError_t memcpy_convert(TargetType* d_ptr, float* h_ptr, size_t count) {
+template <class TargetType>
+[[nodiscard]] cudaError_t memcpy_convert(TargetType *d_ptr, float *h_ptr, size_t count)
+{
     // copy from host to device with data type conversion.
-    TargetType* converted = (TargetType*)malloc(count * sizeof(TargetType));
-    for (int i = 0; i < count; i++) {
+    TargetType *converted = (TargetType *)malloc(count * sizeof(TargetType));
+    for (int i = 0; i < count; i++)
+    {
         converted[i] = (TargetType)h_ptr[i];
     }
 
@@ -280,8 +320,9 @@ template<class TargetType>
     return status;
 }
 
-void setup_main() {
-    srand(0);   // determinism
+void setup_main()
+{
+    srand(0); // determinism
 
     // set up the device
     int deviceIdx = 0;
@@ -307,9 +348,10 @@ void setup_main() {
     cublasCheck(cublasSetMathMode(cublas_handle, cublas_math_mode));
 }
 
-template<class D, class T>
-void validate_result(D* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
-    D* out_gpu = (D*)malloc(num_elements * sizeof(D));
+template <class D, class T>
+void validate_result(D *device_result, const T *cpu_reference, const char *name, std::size_t num_elements, T tolerance = 1e-4)
+{
+    D *out_gpu = (D *)malloc(num_elements * sizeof(D));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(D), cudaMemcpyDeviceToHost));
     int nfaults = 0;
 #ifndef ENABLE_BF16
@@ -317,30 +359,35 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
 #else
     float epsilon = 0.079;
 #endif
-    for (int i = 0; i < num_elements; i++) {
+    for (int i = 0; i < num_elements; i++)
+    {
         // Skip masked elements
-        if(!isfinite(cpu_reference[i]))
+        if (!isfinite(cpu_reference[i]))
             continue;
 
         // print the first few comparisons
-        if (i < 5) {
+        if (i < 5)
+        {
             printf("%f %f\n", cpu_reference[i], (T)out_gpu[i]);
         }
         // effective tolerance is based on expected rounding error (epsilon),
         // plus any specified additional tolerance
         float t_eff = tolerance + fabs(cpu_reference[i]) * epsilon;
         // ensure correctness for all elements.
-        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > t_eff) {
+        if (fabs(cpu_reference[i] - (T)out_gpu[i]) > t_eff)
+        {
             printf("Mismatch of %s at %d: CPU_ref: %f vs GPU: %f\n", name, i, cpu_reference[i], (T)out_gpu[i]);
-            nfaults ++;
-            if (nfaults >= 10) {
+            nfaults++;
+            if (nfaults >= 10)
+            {
                 free(out_gpu);
                 exit(EXIT_FAILURE);
             }
         }
     }
 
-    if (nfaults > 0) {
+    if (nfaults > 0)
+    {
         free(out_gpu);
         exit(EXIT_FAILURE);
     }
@@ -348,8 +395,9 @@ void validate_result(D* device_result, const T* cpu_reference, const char* name,
     free(out_gpu);
 }
 
-template<class Kernel, class... KernelArgs>
-float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) {
+template <class Kernel, class... KernelArgs>
+float benchmark_kernel(int repeats, Kernel kernel, KernelArgs &&...kernel_args)
+{
     cudaEvent_t start, stop;
     // prepare buffer to scrub L2 cache between benchmarks
     // just memset a large dummy array, recommended by
@@ -359,13 +407,14 @@ float benchmark_kernel(int repeats, Kernel kernel, KernelArgs&&... kernel_args) 
     cudaCheck(cudaSetDevice(deviceIdx));
     cudaDeviceProp deviceProp;
     cudaCheck(cudaGetDeviceProperties(&deviceProp, deviceIdx));
-    void* flush_buffer;
+    void *flush_buffer;
     cudaCheck(cudaMalloc(&flush_buffer, deviceProp.l2CacheSize));
 
     cudaCheck(cudaEventCreate(&start));
     cudaCheck(cudaEventCreate(&stop));
     float elapsed_time = 0.f;
-    for (int i = 0; i < repeats; i++) {
+    for (int i = 0; i < repeats; i++)
+    {
         // clear L2
         cudaCheck(cudaMemset(flush_buffer, 0, deviceProp.l2CacheSize));
         // now we can start recording the timing of the kernel

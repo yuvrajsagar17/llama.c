@@ -11,11 +11,13 @@
 void swiglu_forward_cpu(float *out, const float *inp, const float *gate, int N)
 {
     /**
+     *
      * SwiGLU(x) = Swish(x) * Gate(x)
      * SwiGLU(x) = SiLU(x*W) * (x*V)
      * SiLU is the Swish activation function.
      * inp = x*W
      * gate = x*V
+     *
      */
 
     for (int i = 0; i < N; i++)
@@ -30,6 +32,7 @@ void swiglu_forward_cpu(float *out, const float *inp, const float *gate, int N)
 // More abour SwiGLU Gate function:
 
 /**
+ *
  * void swiglu_forward_cpu(float *out, const float *inp, const float *W, const float *V, const float *W2, int N, int M) {
     float *gate = (float *)malloc(N * sizeof(float));
 

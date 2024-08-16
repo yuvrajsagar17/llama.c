@@ -8,10 +8,10 @@ version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops ov
 ./rmsnorm_forward 1
 
 version 2 parallelizes over all of B,T,C
-./layernorm_forward 2
+./rmsnorm_forward 2
 
 version 3 uses cooperative groups to parallelize over all of B,T,C
-./layernorm_forward 3
+./rmsnorm_forward 3
 
 version 4 uses a more clever way to estimate variance, var(x) = mean(x**2) - mean(x)**2
           (allowing us to do a single pass over x on load)
@@ -23,11 +23,17 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <cuda_runtime.h>
 #include <assert.h>
+#include <float.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
+#define ENABLE_BF16
 #include "common.h"
+
 // ----------------------------------------------------------------------------
 // CPU code reference
 
@@ -60,53 +66,13 @@ void rmsnorm_forward_cpu(float *out, const float *inp, const float *weight, cons
     }
 }
 
-// // GPT-2 layernorm forward pass
-// void layernorm_forward_cpu(float *out, float *mean, float *rstd,
-//                            const float *inp, const float *weight, const float *bias,
-//                            int B, int T, int C)
-// {
-//     float eps = 1e-5f;
-//     for (int b = 0; b < B; b++)
-//     {
-//         for (int t = 0; t < T; t++)
-//         {
-//             // seek to the input position inp[b,t,:]
-//             const float *x = inp + b * T * C + t * C;
-//             // calculate the mean
-//             float m = 0.0f;
-//             for (int i = 0; i < C; i++)
-//             {
-//                 m += x[i];
-//             }
-//             m = m / C;
-//             // calculate the variance (without any bias correction)
-//             float v = 0.0f;
-//             for (int i = 0; i < C; i++)
-//             {
-//                 float xshift = x[i] - m;
-//                 v += xshift * xshift;
-//             }
-//             v = v / C;
-//             // calculate the rstd
-//             float s = 1.0f / sqrtf(v + eps);
-//             // seek to the output position in out[b,t,:]
-//             float *out_bt = out + b * T * C + t * C;
-//             for (int i = 0; i < C; i++)
-//             {
-//                 float n = (s * (x[i] - m));        // normalized output
-//                 float o = n * weight[i] + bias[i]; // scale and shift it
-//                 out_bt[i] = o;                     // write
-//             }
-//             // cache the mean and rstd for the backward pass later
-//             mean[b * T + t] = m;
-//             rstd[b * T + t] = s;
-//         }
-//     }
-// }
-
 // ----------------------------------------------------------------------------
 // GPU kernels
 
+/**
+ * RMS-Norm Kernel:
+ *
+ */
 __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const float *weight, const float *bias, int N, int C)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -134,83 +100,6 @@ __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const floa
     }
 }
 
-// __global__ void mean_kernel(float *mean, const float *inp, int N, int C, int block_size)
-// {
-//     extern __shared__ float shared[];
-//     int idx = blockIdx.x;  // range [0, B*T)
-//     int tid = threadIdx.x; // range [0, block_size)
-//     const float *x = inp + idx * C;
-//     // thread coarsening
-//     float sum = 0.0f;
-//     for (int i = tid; i < C; i += block_size)
-//     {
-//         sum += x[i];
-//     }
-//     shared[tid] = sum;
-//     __syncthreads();
-//     // reductions
-//     for (int stride = block_size / 2; stride >= 1; stride /= 2)
-//     {
-//         __syncthreads();
-//         if (tid < stride)
-//         {
-//             shared[tid] += shared[tid + stride];
-//         }
-//     }
-//     // write the final result (at thread 0) to global memory
-//     if (tid == 0)
-//     {
-//         mean[idx] = shared[0] / C;
-//     }
-// }
-
-// __global__ void rstd_kernel(float *rstd, const float *inp, const float *mean, int N, int C, int block_size)
-// {
-//     extern __shared__ float shared[];
-//     int idx = blockIdx.x;  // range [0, B*T)
-//     int tid = threadIdx.x; // range [0, block_size)
-//     const float *x = inp + idx * C;
-//     float m = mean[idx];
-//     // thread coarsening
-//     float sum = 0.0f;
-//     for (int i = tid; i < C; i += block_size)
-//     {
-//         float diff = x[i] - m;
-//         sum += diff * diff;
-//     }
-//     shared[tid] = sum;
-//     __syncthreads();
-//     // reductions
-//     for (int stride = block_size / 2; stride >= 1; stride /= 2)
-//     {
-//         __syncthreads();
-//         if (tid < stride)
-//         {
-//             shared[tid] += shared[tid + stride];
-//         }
-//     }
-//     // write the final result (at thread 0) to global memory
-//     if (tid == 0)
-//     {
-//         rstd[idx] = 1.0f / sqrtf(shared[0] / C + 1e-5f);
-//     }
-// }
-
-// __global__ void normalization_kernel(float *out, const float *inp, float *mean, float *rstd,
-//                                      const float *weight, const float *bias, int B, int T, int C)
-// {
-//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-//     int bt = idx / C;
-//     int c = idx % C;
-//     float m = mean[bt];
-//     float s = rstd[bt];
-//     float xi = inp[idx];
-//     float n = s * (xi - m);
-//     float o = n * weight[c] + bias[c];
-
-//     out[idx] = o;
-// }
-
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -221,24 +110,6 @@ void rmsnorm_forward1(float *out, const float *inp, const float *weight, const f
     rmsnorm_forward_kernel1<<<grid_size, block_size>>>(out, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
-
-// void rmsnorm_forward2(float *out, float *mean, float *rstd,
-//                       const float *inp, const float *weight, const float *bias,
-//                       int B, int T, int C,
-//                       const int block_size)
-// {
-//     int N = B * T;
-//     // in mean and rstd, threads cooperate within blocks via reductions
-//     mean_kernel<<<N, block_size, block_size * sizeof(float)>>>(mean, inp, N, C, block_size);
-//     cudaCheck(cudaGetLastError());
-//     rstd_kernel<<<N, block_size, block_size * sizeof(float)>>>(rstd, inp, mean, N, C, block_size);
-//     cudaCheck(cudaGetLastError());
-//     // in the normalization, everything just gets flattened out
-//     const int block_size2 = 256;
-//     const int grid_size = ceil_div(B * T * C, block_size2);
-//     normalization_kernel<<<grid_size, block_size2>>>(out, inp, mean, rstd, weight, bias, B, T, C);
-//     cudaCheck(cudaGetLastError());
-// }
 
 // kernel version dispatch
 void rmsnorm_forward(int kernel_num,
@@ -324,37 +195,37 @@ int main(int argc, char **argv)
 
     printf("All results match. Starting benchmarks.\n\n");
 
-    // // time the kernel at different block sizes
-    // for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
-    // {
-    //     int block_size = block_sizes[j];
+    // time the kernel at different block sizes
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
+    {
+        int block_size = block_sizes[j];
 
-    //     int repeat_times = 2000;
-    //     float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_forward,
-    //                                           kernel_num, d_out, d_inp, d_weight, d_bias,
-    //                                           B, T, C, block_size);
+        int repeat_times = 2000;
+        float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_forward,
+                                              kernel_num, d_out, d_inp, d_weight, d_bias,
+                                              B, T, C, block_size);
 
-    //     // napkin math: estimate the memory bandwidth achieved
-    //     // e.g. A100 40GB PCIe is advertised at 1,555GB/s
-    //     long memory_ops = (2 * B * T * C) * 4; // *4 for float
-    //     float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+        // napkin math: estimate the memory bandwidth achieved
+        // e.g. A100 40GB PCIe is advertised at 1,555GB/s
+        long memory_ops = (2 * B * T * C) * 4; // *4 for float
+        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
 
-    //     printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
-}
+        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
+    }
 
-// free memory
-free(out);
-// free(mean);
-// free(rstd);
-free(inp);
-free(weight);
-free(bias);
-cudaCheck(cudaFree(d_out));
-// cudaCheck(cudaFree(d_mean));
-// cudaCheck(cudaFree(d_rstd));
-cudaCheck(cudaFree(d_inp));
-cudaCheck(cudaFree(d_weight));
-cudaCheck(cudaFree(d_bias));
+    // free memory
+    free(out);
+    // free(mean);
+    // free(rstd);
+    free(inp);
+    free(weight);
+    free(bias);
+    cudaCheck(cudaFree(d_out));
+    // cudaCheck(cudaFree(d_mean));
+    // cudaCheck(cudaFree(d_rstd));
+    cudaCheck(cudaFree(d_inp));
+    cudaCheck(cudaFree(d_weight));
+    cudaCheck(cudaFree(d_bias));
 
-return 0;
+    return 0;
 }
