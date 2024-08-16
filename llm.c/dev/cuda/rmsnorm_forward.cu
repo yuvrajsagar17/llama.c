@@ -100,6 +100,46 @@ __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const floa
     }
 }
 
+__global__ void rmsnorm_forward_kernel2(float *__restrict__ out, const float *__restrict__ inp,
+                                        const float *__restrict__ weight, const float *__restrict__ bias,
+                                        int N, int C)
+{
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // Calculate thread index within grid (each warp handles one row)
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= N)
+    {
+        return;
+    }
+
+    // Pointer to input row
+    const float *x = inp + idx * C;
+
+    // RMS Calculation: First calculate sum of squares
+    float sum_squares = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+    {
+        sum_squares += x[i] * x[i];
+    }
+
+    // Reduce sum across threads within the warp
+    sum_squares = cg::reduce(warp, sum_squares, cg::plus<float>{});
+
+    // Calculate RMS
+    float rms = sqrtf(sum_squares / C + 1e-5f);
+
+    // Final normalization and scaling by weight/bias
+    float *o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size())
+    {
+        float n = __ldcs(x + c) / rms;          // Normalized output
+        __stcs(o + c, n * weight[c] + bias[c]); // Scale, shift and write output
+    }
+}
+
 // ----------------------------------------------------------------------------
 // kernel launcher
 
@@ -108,6 +148,16 @@ void rmsnorm_forward1(float *out, const float *inp, const float *weight, const f
     const int N = B * T;
     const int grid_size = (N + block_size - 1) / block_size; // equivalent to ceil(N / block_size)
     rmsnorm_forward_kernel1<<<grid_size, block_size>>>(out, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void rmsnorm_forward2(float *out, const float *inp, const float *weight, const float *bias,
+                      int B, int T, int C, const int block_size)
+{
+    assert(block_size % 32 == 0);
+    const int N = B * T;
+    const int grid_size = (N * 32 + block_size - 1) / block_size;
+    rmsnorm_forward_kernel2<<<grid_size, block_size>>>(out, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -123,9 +173,9 @@ void rmsnorm_forward(int kernel_num,
     case 1:
         rmsnorm_forward1(out, inp, weight, bias, B, T, C, block_size);
         break;
-    // case 2:
-    //     rmsnorm_forward2(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
-    //     break;
+    case 2:
+        rmsnorm_forward2(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+        break;
     default:
         printf("Invalid kernel number\n");
         exit(1);
