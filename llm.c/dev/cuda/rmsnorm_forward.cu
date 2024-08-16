@@ -174,7 +174,7 @@ void rmsnorm_forward(int kernel_num,
         rmsnorm_forward1(out, inp, weight, bias, B, T, C, block_size);
         break;
     case 2:
-        rmsnorm_forward2(out, mean, rstd, inp, weight, bias, B, T, C, block_size);
+        rmsnorm_forward2(out, inp, weight, bias, B, T, C, block_size);
         break;
     default:
         printf("Invalid kernel number\n");
