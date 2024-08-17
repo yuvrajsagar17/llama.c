@@ -4,11 +4,30 @@ Kernels for layernorm backward pass.
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt rmsnorm_backward.cu -o rmsnorm_backward
 
-version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
+* version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./rmsnorm_backward 1
 
-version 2 moves a lot of reduction to shared memory over global memory
+RESULTS: (on L4-GPU)
+block_size   32 | time 3.4939 ms | bandwidth 14.41 GB/s
+block_size   64 | time 3.2542 ms | bandwidth 15.47 GB/s
+block_size  128 | time 3.3129 ms | bandwidth 15.19 GB/s
+block_size  256 | time 3.3933 ms | bandwidth 14.83 GB/s
+block_size  512 | time 5.0531 ms | bandwidth 9.96 GB/s
+block_size 1024 | time 6.9545 ms | bandwidth 7.24 GB/
+
+* version 2 uses co-operative groups to work with warp-level reductions with a warp_size of 32 threads, parallelizes over B,T,C
+~9x faster than kernel 1.
 ./rmsnorm_backward 2
+
+RESULTS: (on L4-GPU)
+block_size   32 | time 0.3957 ms | bandwidth 127.21 GB/s
+block_size   64 | time 0.4064 ms | bandwidth 123.83 GB/s
+block_size  128 | time 0.4066 ms | bandwidth 123.79 GB/s
+block_size  256 | time 0.4075 ms | bandwidth 123.52 GB/s
+block_size  512 | time 0.4061 ms | bandwidth 123.95 GB/s
+block_size 1024 | time 0.4092 ms | bandwidth 122.99 GB/s
+
+
 */
 
 #include <stdio.h>
@@ -27,11 +46,9 @@ version 2 moves a lot of reduction to shared memory over global memory
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-// LLama RMSNorm forward pass
+// RMSNorm Forward CPU Reference Code
 void rmsnorm_forward_cpu(float *out, const float *inp, const float *weight, const float *bias, int B, int T, int C)
 {
-    // https://pytorch.org/torchtune/stable/generated/torchtune.modules.RMSNorm.html
-    // Source Code: https://pytorch.org/torchtune/stable/_modules/torchtune/modules/rms_norm.html#RMSNorm.forward
     float eps = 1e-5f;
     for (int b = 0; b < B; b++)
     {
@@ -148,7 +165,60 @@ __global__ void rmsnorm_backward_kernel1(float *dinp, float *dweight, float *dbi
     // Now, calculate the gradients for the inputs
     for (int i = 0; i < C; i++)
     {
+        dinp_bt[i] = dout_bt[i] * weight[i] / rms + drms * inp_bt[i];
+    }
+}
+
+// __restrict__ will hint the compiler to optimize the code better.
+// Using __restrict__ will ensure no aliasing, and compiler can (freedom to) utilize maximum registers and stuff for optimization
+__global__ void rmsnorm_backward_kernel2(float *__restrict__ dinp, float *__restrict__ dweight, float *__restrict__ dbias,
+                                         const float *__restrict__ dout, const float *__restrict__ inp, const float *__restrict__ weight, const float *__restrict__ bias,
+                                         int N, int C)
+{
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // Calculate thread index within grid (each warp handles one row)
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if (idx >= N)
+        return;
+
+    const float eps = 1e-5f;
+    const float *dout_bt = dout + idx * C;
+    const float *inp_bt = inp + idx * C;
+    float *dinp_bt = dinp + idx * C;
+
+    // Compute the RMS using cooperative group reduction
+    float sum_squares = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+    {
+        sum_squares += inp_bt[i] * inp_bt[i];
+    }
+    sum_squares = cg::reduce(warp, sum_squares, cg::plus<float>());
+    float rms = sqrtf(sum_squares / C + eps);
+
+    // Calculate the gradients for the weights and biases (accumulated across threads)
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+    {
         float norm = inp_bt[i] / rms;
+        // Accumulate gradient for bias and weight using atomicAdd with warp-level synchronization
+        atomicAdd(&dbias[i], dout_bt[i]);
+        atomicAdd(&dweight[i], norm * dout_bt[i]);
+    }
+
+    // Compute drms (gradient with respect to rms)
+    float drms = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+    {
+        drms += inp_bt[i] * dout_bt[i] * weight[i];
+    }
+    drms = cg::reduce(warp, drms, cg::plus<float>());
+    drms = drms * (-1.0f / (rms * rms * rms * C));
+
+    // Step 4: Compute gradients for inputs
+    for (int i = warp.thread_rank(); i < C; i += warp.size())
+    {
         dinp_bt[i] = dout_bt[i] * weight[i] / rms + drms * inp_bt[i];
     }
 }
@@ -161,8 +231,19 @@ void rmsnorm_backward1(float *dinp, float *dweight, float *dbias,
                        int B, int T, int C, const int block_size)
 {
     const int N = B * T;
-    const int grid_size = (N + block_size - 1) / block_size; // equivalent to ceil(N / block_size)
+    const int grid_size = ceil_div((N + block_size - 1), block_size); // equivalent to ceil(N / block_size)
     rmsnorm_backward_kernel1<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void rmsnorm_backward2(float *dinp, float *dweight, float *dbias,
+                       const float *dout, const float *inp, const float *weight, const float *bias,
+                       int B, int T, int C, const int block_size)
+{
+    assert(block_size % 32 == 0); // Ensure block size is a multiple of warp size
+    const int N = B * T;
+    const int grid_size = ceil_div((N * 32 + block_size - 1), block_size);
+    rmsnorm_backward_kernel2<<<grid_size, block_size>>>(dinp, dweight, dbias, dout, inp, weight, bias, N, C);
     cudaCheck(cudaGetLastError());
 }
 
@@ -178,7 +259,9 @@ void rmsnorm_backward(int kernel_num,
     case 1:
         rmsnorm_backward1(dinp, dweight, dbias, dout, inp, weight, bias, B, T, C, block_size);
         break;
-
+    case 2:
+        rmsnorm_backward2(dinp, dweight, dbias, dout, inp, weight, bias, B, T, C, block_size);
+        break;
     default:
         printf("Invalid kernel number\n");
         exit(1);
@@ -194,7 +277,7 @@ int main(int argc, char **argv)
 
     int B = 8;
     int T = 1024;
-    int C = 768; // corrected embed_dim
+    int C = 768; // embed_dim
 
     // first do the forward pass in CPU
     float *out = (float *)malloc(B * T * C * sizeof(float));
@@ -239,9 +322,10 @@ int main(int argc, char **argv)
     cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_weight, C * sizeof(float)));
+    cudaCheck(cudaMalloc(&d_bias, C * sizeof(float)));
 
     // copy over the "inputs" to the backward call
-    cudaCheck(memcpy_convert(w, dout, B * T * C));
+    cudaCheck(memcpy_convert(d_dout, dout, B * T * C));
     cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
     cudaCheck(memcpy_convert(d_weight, weight, C));
     cudaCheck(memcpy_convert(d_bias, bias, C));
@@ -281,7 +365,13 @@ int main(int argc, char **argv)
         float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_backward, kernel_num,
                                               d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_bias,
                                               B, T, C, block_size);
-        printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
+
+        // napkin math: estimate the memory bandwidth achieved
+        // e.g. A100 40GB PCIe is advertised at 1,555GB/s
+        long memory_ops = (2 * B * T * C) * 4; // *4 for float
+        float memory_bandwidth = memory_ops / elapsed_time / 1e6;
+
+        printf("block_size %4d | time %.4f ms | bandwidth %.2f GB/s\n", block_size, elapsed_time, memory_bandwidth);
     }
 
     // cleanups
@@ -301,6 +391,5 @@ int main(int argc, char **argv)
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_weight));
     cudaCheck(cudaFree(d_bias));
-    cudaCheck(cudaFree(d_scratch));
     return 0;
 }

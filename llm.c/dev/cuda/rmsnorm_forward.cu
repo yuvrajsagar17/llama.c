@@ -1,24 +1,34 @@
 /*
 Kernels for layernorm forward pass.
+The results shown are performed on L4-GPU
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt rmsnorm_forward.cu -o rmsnorm_forward
 
-version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
+- version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
 ./rmsnorm_forward 1
 
-version 2 parallelizes over all of B,T,C
+RESULTS:
+block size   32 | time 0.5607 ms | bandwidth 89.76 GB/s
+block_size   64 | time 0.6078 ms | bandwidth 82.81 GB/s
+block_size  128 | time 0.6814 ms | bandwidth 73.86 GB/s
+block_size  256 | time 0.6786 ms | bandwidth 74.17 GB/s
+block_size  512 | time 0.9401 ms | bandwidth 53.54 GB/s
+block_size 1024 | time 1.8104 ms | bandwidth 27.80 GB/s
+
+
+- version 2 uses co-operative groups to work with warp-level reductions with a warp_size of 32 threads, parallelizes over B,T,C
 ./rmsnorm_forward 2
 
-version 3 uses cooperative groups to parallelize over all of B,T,C
-./rmsnorm_forward 3
+RESULTS:
+All results match. Starting benchmarks.
+block_size   32 | time 0.2380 ms | bandwidth 211.52 GB/s
+block_size   64 | time 0.2438 ms | bandwidth 206.44 GB/s
+block_size  128 | time 0.2445 ms | bandwidth 205.83 GB/s
+block_size  256 | time 0.2434 ms | bandwidth 206.79 GB/s
+block_size  512 | time 0.2421 ms | bandwidth 207.89 GB/s
+block_size 1024 | time 0.2405 ms | bandwidth 209.31 GB/s
 
-version 4 uses a more clever way to estimate variance, var(x) = mean(x**2) - mean(x)**2
-          (allowing us to do a single pass over x on load)
-./layernorm_forward 4
-
-verstion 5 allocates blocks per row instead of warps per row, same alg as 4 otherwise
-./layernorm_forward 5
 */
 
 #include <stdio.h>
@@ -70,13 +80,13 @@ void rmsnorm_forward_cpu(float *out, const float *inp, const float *weight, cons
 // GPU kernels
 
 /**
- * RMS-Norm Kernel:
+ * RMSNorm Kernel:
  *
+ *   // https://pytorch.org/torchtune/stable/generated/torchtune.modules.RMSNorm.html
+ *   // Source Code: https://pytorch.org/torchtune/stable/_modules/torchtune/modules/rms_norm.html#RMSNorm.forward
  */
 __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const float *weight, const float *bias, int N, int C)
 {
-    // https://pytorch.org/torchtune/stable/generated/torchtune.modules.RMSNorm.html
-    // Source Code: https://pytorch.org/torchtune/stable/_modules/torchtune/modules/rms_norm.html#RMSNorm.forward
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     float eps = 1e-5f;
 
@@ -102,6 +112,8 @@ __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const floa
     }
 }
 
+// __restrict__ will hint the compiler to optimize the code better.
+// Using __restrict__ will ensure no aliasing, and compiler can (freedom to) utilize maximum registers and stuff for optimization
 __global__ void rmsnorm_forward_kernel2(float *__restrict__ out, const float *__restrict__ inp,
                                         const float *__restrict__ weight, const float *__restrict__ bias,
                                         int N, int C)
