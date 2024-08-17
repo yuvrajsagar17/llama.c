@@ -75,6 +75,8 @@ void rmsnorm_forward_cpu(float *out, const float *inp, const float *weight, cons
  */
 __global__ void rmsnorm_forward_kernel1(float *out, const float *inp, const float *weight, const float *bias, int N, int C)
 {
+    // https://pytorch.org/torchtune/stable/generated/torchtune.modules.RMSNorm.html
+    // Source Code: https://pytorch.org/torchtune/stable/_modules/torchtune/modules/rms_norm.html#RMSNorm.forward
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     float eps = 1e-5f;
 

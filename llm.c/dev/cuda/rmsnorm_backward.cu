@@ -30,6 +30,8 @@ version 2 moves a lot of reduction to shared memory over global memory
 // LLama RMSNorm forward pass
 void rmsnorm_forward_cpu(float *out, const float *inp, const float *weight, const float *bias, int B, int T, int C)
 {
+    // https://pytorch.org/torchtune/stable/generated/torchtune.modules.RMSNorm.html
+    // Source Code: https://pytorch.org/torchtune/stable/_modules/torchtune/modules/rms_norm.html#RMSNorm.forward
     float eps = 1e-5f;
     for (int b = 0; b < B; b++)
     {
@@ -78,6 +80,7 @@ void rmsnorm_backward_cpu(float *dinp, float *dweight, float *dbias,
             rms = sqrtf(rms / C + eps);
 
             // First, calculate the gradients for the weights and biases
+            // using `+=` for gradients accumuation.
             for (int i = 0; i < C; i++)
             {
                 float norm = inp_bt[i] / rms;
@@ -230,22 +233,20 @@ int main(int argc, char **argv)
     float *d_weight;
     float *d_bias;
 
-    float *d_scratch;
     cudaCheck(cudaMalloc(&d_dinp, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_dweight, C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_dbias, C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_weight, C * sizeof(float)));
-    cudaCheck(cudaMalloc(&d_scratch, (1024 / 32) * cuda_num_SMs * (2 * C + 1) * sizeof(float)));
+
     // copy over the "inputs" to the backward call
-    cudaCheck(memcpy_convert(d_dout, dout, B * T * C));
+    cudaCheck(memcpy_convert(w, dout, B * T * C));
     cudaCheck(memcpy_convert(d_inp, inp, B * T * C));
     cudaCheck(memcpy_convert(d_weight, weight, C));
     cudaCheck(memcpy_convert(d_bias, bias, C));
 
     // launch the kernel
-    // removed 768 because it doesn't work for kernel9 despite being OK in train_gpt2.cu?!
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
     {
@@ -277,7 +278,7 @@ int main(int argc, char **argv)
     {
         int block_size = block_sizes[j];
         int repeat_times = 100;
-        float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_backward_cpu, kernel_num,
+        float elapsed_time = benchmark_kernel(repeat_times, rmsnorm_backward, kernel_num,
                                               d_dinp, d_dweight, d_dbias, d_dout, d_inp, d_weight, d_bias,
                                               B, T, C, block_size);
         printf("block_size %4d time %.4f ms\n", block_size, elapsed_time);
