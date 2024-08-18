@@ -1,3 +1,35 @@
+/*
+Kernels for swiglu forward pass.
+NOTE: The results shown are performed on L4-GPU
+
+Compile example:
+nvcc -O3 --use_fast_math -lcublas -lcublasLt swiglu_backward.cu -o swiglu_backward
+
+- version 1 is naive port from CPU code to kernel: parallelizes over B,T,C
+./swiglu_backward 1
+
+RESULTS:
+block_size   32 | time 0.3041 ms | bandwidth 165.51 GB/s
+block_size   64 | time 0.2923 ms | bandwidth 172.18 GB/s
+block_size  128 | time 0.2926 ms | bandwidth 172.04 GB/s
+block_size  256 | time 0.2927 ms | bandwidth 171.98 GB/s
+block_size  512 | time 0.2911 ms | bandwidth 172.89 GB/s
+block_size 1024 | time 0.2869 ms | bandwidth 175.42 GB/s
+
+
+- version 2 uses 2 bfloat16 with the Packed128 data structure which helps in faster load/store operations, parallelizes over B,T,C
+./swiglu_backward 2
+
+RESULTS:
+block_size   32 | time 0.2901 ms | bandwidth 173.50 GB/s
+block_size   64 | time 0.2972 ms | bandwidth 169.38 GB/s
+block_size  128 | time 0.2957 ms | bandwidth 170.20 GB/s
+block_size  256 | time 0.2972 ms | bandwidth 169.37 GB/s
+block_size  512 | time 0.2928 ms | bandwidth 171.92 GB/s
+block_size 1024 | time 0.2899 ms | bandwidth 173.62 GB/s
+
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
@@ -8,71 +40,136 @@
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-void swiglu_backward_cpu(float *dinp, const float *inp, const float *gate, const float *dout, int N)
+void swiglu_backward_cpu(float *dinp, float *dgate, const float *dout, const float *inp, const float *gate, int N)
 {
     /**
+     *
+     * Reference Implementation:
      * y=SiLU(xW)*(xV)
      * z=xW
      * g=xV
      *
-     * Using Chain-Rule
-     * ∂y/∂x = (σ(z) + z*σ(z)*(1−σ(z)))*g*W + SiLU(z)*V
+     * Using Chain-Rule:
+     *
+     * ∂SILU(z)/∂z = (σ(z) + SiLU(z)*(1-σ(z))
+     *
+     * ∂L/∂z = ∂L/∂out * ∂SILU(z)/∂z * g
+     * ∂L/∂g = ∂L/∂out * SILU(z)/∂z
+     *
      */
     for (int i = 0; i < N; i++)
     {
-        float z = inp[i];
-        float g = gate[i];
-        float y = z / (1.0f + expf(-z)) * g;                   // SwiGLU(x)
-        float sig_z = 1.0f / (1.0f + expf(-z));                // Sigmoid(z)
-        float silu_prime = sig_z + z * sig_z * (1.0f - sig_z); // SiLU'(xW)
-        float grad_z = (silu_prime * g) * dout[i];             // Gradient w.r.t. xW
-        float grad_g = (z / (1.0f + expf(-z))) * dout[i];      // Gradient w.r.t. xV
-        dinp[i] = grad_z + grad_g;                             // Sum of gradients
+        // Recalculating SiLU & calculating sigmoid
+        float sigmoid = 1.0f / (1.0f + expf(-inp[i]));
+        float siLU = inp[i] / (1.0f + expf(-inp[i]));
+
+        // Gradient of SwiGLU w.r.t inp
+        dinp[i] = dout[i] * (sigmoid + siLU * (1.0f - sigmoid)) * gate[i];
+
+        // Gradient of SwiGLU w.r.t gate
+        dgate[i] = dout[i] * siLU;
     }
 }
 
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-__global__ void swiglu_backward_kernel1(floatX *dinp, const floatX *inp, const floatX *gate, const floatX *dout, int N)
+__global__ void swiglu_backward_kernel1(floatX *dinp, floatX *dgate,
+                                        const floatX *dout,
+                                        const floatX *inp, const floatX *gate, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N)
     {
-        float xW = (float)inp[i];
-        float xV = (float)gate[i];
-        float y = xW / (1.0f + expf(-xW)) * xV;                    // SwiGLU(x)
-        float sig_xW = 1.0f / (1.0f + expf(-xW));                  // Sigmoid(xW)
-        float silu_prime = sig_xW + xW * sig_xW * (1.0f - sig_xW); // SiLU'(xW)
-        float grad_xW = (silu_prime * xV) * dout[i];               // Gradient w.r.t. xW
-        float grad_xV = (xW / (1.0f + expf(-xW))) * dout[i];       // Gradient w.r.t. xV
-        dinp[i] = grad_xW + grad_xV;                               // Sum of gradients
+
+        // Calculate sigmoid and SiLU (Swish) activations
+        floatX sigmoid = 1.0f / (1.0f + expf(-inp[i]));
+        floatX siLU = inp[i] * sigmoid;
+
+        // Perform gradient computations
+        dinp[i] = dout[i] * (sigmoid + siLU * ((floatX)1.0f - sigmoid)) * gate[i];
+        dgate[i] = dout[i] * siLU;
+    }
+}
+
+/**
+ * Uses `x128`, a custom-datatype responsible for faster processing (load and store) capabilities
+ *
+ *  By loading, processing, and storing 4 floats at a time (or however many the data type holds), you reduce the number of memory accesses and arithmetic operations, and thus resulting in better throughput and efficiency
+ */
+__global__ void swiglu_backward_kernel2(floatX *dinp, floatX *dgate,
+                                        const floatX *dout,
+                                        const floatX *inp, const floatX *gate, int N)
+{
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    if (i < N)
+    {
+        // Packed variables for dinp, dgate, dout, inp, gate
+        x128 packed_dinp, packed_dgate;
+        x128 packed_dout = load128cs(dout + i);
+        x128 packed_inp = load128cs(inp + i);
+        x128 packed_gate = load128cs(gate + i);
+
+        for (int k = 0; k < packed_inp.size; ++k)
+        {
+            // Compute the SiLU and sigmoid for each packed element
+            floatX xiW = (floatX)packed_inp[k];  // input
+            floatX xiV = (floatX)packed_gate[k]; // gate
+            floatX dxi = (floatX)packed_dout[k]; // dout
+
+            // Calculate sigmoid and SiLU (Swish) activations
+            floatX sigmoid = 1.0f / (1.0f + expf(-xiW));
+            floatX siLU = xiW * sigmoid;
+
+            // Gradient of SwiGLU w.r.t inp and gate
+            packed_dinp[k] = dxi * (sigmoid + siLU * ((floatX)1.0f - sigmoid)) * xiV;
+            packed_dgate[k] = dxi * siLU;
+        }
+
+        // Store the gradients back to global memory
+        store128(dinp + i, packed_dinp);
+        store128(dgate + i, packed_dgate);
     }
 }
 
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void swiglu_backward1(floatX *dinp, const floatX *inp, const floatX *gate, const floatX *dout, int N, const int block_size)
+void swiglu_backward1(floatX *dinp, floatX *dgate,
+                      const floatX *dout,
+                      const floatX *inp, const floatX *gate, int N,
+                      int block_size)
 {
+
     const int grid_size = ceil_div(N, block_size);
-    swiglu_backward_kernel1<<<grid_size, block_size>>>(dinp, inp, gate, dout, N);
+    swiglu_backward_kernel1<<<grid_size, block_size>>>(dinp, dgate, dout, inp, gate, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void swiglu_backward2(floatX *dinp, floatX *dgate,
+                      const floatX *dout,
+                      const floatX *inp, const floatX *gate, int N,
+                      int block_size)
+{
+    const int grid_size = ceil_div(N, block_size * x128::size);
+    swiglu_backward_kernel2<<<grid_size, block_size>>>(dinp, dgate, dout, inp, gate, N);
     cudaCheck(cudaGetLastError());
 }
 
 // kernel version dispatch
-void swiglu_backward(int kernel_num,
-                     floatX *dinp,
-                     const floatX *inp,
-                     const floatX *gate,
+void swiglu_backward(int kernel_num, floatX *dinp, floatX *dgate,
                      const floatX *dout,
+                     const floatX *inp, const floatX *gate,
                      int B, int T, int C,
                      int block_size)
 {
     switch (kernel_num)
     {
     case 1:
-        swiglu_backward1(dinp, inp, gate, dout, B * T * C, block_size);
+        swiglu_backward1(dinp, dgate, dout, inp, gate, B * T * C, block_size);
+        break;
+    case 2:
+        swiglu_backward2(dinp, dgate, dout, inp, gate, B * T * C, block_size);
         break;
 
     default:
@@ -93,9 +190,11 @@ int main(int argc, const char **argv)
 
     // create host memory of random numbers
     float *dinp = (float *)malloc(B * T * C * sizeof(float));
-    float *inp = make_random_float(B * T * C);  // precomputed x*W
-    float *gate = make_random_float(B * T * C); // precomputed x*V
-    float *dout = make_random_float(B * T * C);
+    float *dgate = (float *)malloc(B * T * C * sizeof(float));
+
+    float *inp = (float *)make_random_float(B * T * C);  // precomputed x*W
+    float *gate = (float *)make_random_float(B * T * C); // precomputed x*V
+    float *dout = (float *)make_random_float(B * T * C);
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -106,14 +205,16 @@ int main(int argc, const char **argv)
     printf("Using kernel %d\n", kernel_num);
 
     // first check the correctness of the kernel
-    swiglu_backward_cpu(dinp, inp, gate, dout, B * T * C);
+    swiglu_backward_cpu(dinp, dgate, dout, inp, gate, B * T * C);
 
     // move to GPU
     floatX *d_dinp;
+    floatX *d_dgate;
     floatX *d_inp;
     floatX *d_gate;
     floatX *d_dout;
     cudaCheck(cudaMalloc(&d_dinp, B * T * C * sizeof(floatX)));
+    cudaCheck(cudaMalloc(&d_dgate, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_inp, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_gate, B * T * C * sizeof(floatX)));
     cudaCheck(cudaMalloc(&d_dout, B * T * C * sizeof(floatX)));
@@ -127,13 +228,14 @@ int main(int argc, const char **argv)
     {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        swiglu_backward(kernel_num, d_dinp, d_inp, d_gate, d_dout, B, T, C, block_size);
+        swiglu_backward(kernel_num, d_dinp, d_dgate, d_dout, d_inp, d_gate, B, T, C, block_size);
 #if !defined(ENABLE_BF16) && !defined(ENABLE_FP16)
         float tol = 1e-5;
 #else
         float tol = 1e-2f;
 #endif
         validate_result(d_dinp, dinp, "dinp", B * T * C, tol);
+        validate_result(d_dgate, dgate, "dgate", B * T * C, tol);
     }
 
     printf("All results match. Starting benchmarks.\n\n");
@@ -145,8 +247,8 @@ int main(int argc, const char **argv)
         int repeat_times = 1000;
 
         float elapsed_time = benchmark_kernel(repeat_times, swiglu_backward,
-                                              kernel_num, d_dinp, d_inp, d_gate, d_dout,
-                                              B, T, C, block_size);
+                                              kernel_num, d_dinp, d_dgate, d_dout,
+                                              d_inp, d_gate, B, T, C, block_size);
 
         // napkin math: estimate the memory bandwidth achieved
         // for each (B,T,C) output element, we do 1 read and 1 write, 4 bytes each
@@ -159,11 +261,13 @@ int main(int argc, const char **argv)
 
     // free memory
     free(dinp);
+    free(dgate);
     free(inp);
     free(gate);
     free(dout);
 
     cudaCheck(cudaFree(d_dinp));
+    cudaCheck(cudaFree(d_dgate));
     cudaCheck(cudaFree(d_inp));
     cudaCheck(cudaFree(d_gate));
     cudaCheck(cudaFree(d_dout));
