@@ -9,24 +9,24 @@ nvcc -O3 --use_fast_math -lcublas -lcublasLt swiglu_backward.cu -o swiglu_backwa
 ./swiglu_backward 1
 
 RESULTS:
-block_size   32 | time 0.3041 ms | bandwidth 165.51 GB/s
-block_size   64 | time 0.2923 ms | bandwidth 172.18 GB/s
-block_size  128 | time 0.2926 ms | bandwidth 172.04 GB/s
-block_size  256 | time 0.2927 ms | bandwidth 171.98 GB/s
-block_size  512 | time 0.2911 ms | bandwidth 172.89 GB/s
-block_size 1024 | time 0.2869 ms | bandwidth 175.42 GB/s
+block_size   32 | time 0.3049 ms | bandwidth 165.08 GB/s
+block_size   64 | time 0.2911 ms | bandwidth 172.93 GB/s
+block_size  128 | time 0.2918 ms | bandwidth 172.51 GB/s
+block_size  256 | time 0.2910 ms | bandwidth 172.98 GB/s
+block_size  512 | time 0.2906 ms | bandwidth 173.21 GB/s
+block_size 1024 | time 0.2899 ms | bandwidth 173.64 GB/s
 
 
 - version 2 uses 2 bfloat16 with the Packed128 data structure which helps in faster load/store operations, parallelizes over B,T,C
 ./swiglu_backward 2
 
 RESULTS:
-block_size   32 | time 0.2901 ms | bandwidth 173.50 GB/s
-block_size   64 | time 0.2972 ms | bandwidth 169.38 GB/s
-block_size  128 | time 0.2957 ms | bandwidth 170.20 GB/s
-block_size  256 | time 0.2972 ms | bandwidth 169.37 GB/s
-block_size  512 | time 0.2928 ms | bandwidth 171.92 GB/s
-block_size 1024 | time 0.2899 ms | bandwidth 173.62 GB/s
+block_size   32 | time 0.2900 ms | bandwidth 173.59 GB/s
+block_size   64 | time 0.2968 ms | bandwidth 169.59 GB/s
+block_size  128 | time 0.2954 ms | bandwidth 170.37 GB/s
+block_size  256 | time 0.2967 ms | bandwidth 169.64 GB/s
+block_size  512 | time 0.2923 ms | bandwidth 172.22 GB/s
+block_size 1024 | time 0.2895 ms | bandwidth 173.83 GB/s
 
 */
 
@@ -64,10 +64,10 @@ void swiglu_backward_cpu(float *dinp, float *dgate, const float *dout, const flo
         float siLU = inp[i] / (1.0f + expf(-inp[i]));
 
         // Gradient of SwiGLU w.r.t inp
-        dinp[i] = dout[i] * (sigmoid + siLU * (1.0f - sigmoid)) * gate[i];
+        dinp[i] = (dout[i] * (sigmoid + siLU * (1.0f - sigmoid)) * gate[i]);
 
         // Gradient of SwiGLU w.r.t gate
-        dgate[i] = dout[i] * siLU;
+        dgate[i] = (dout[i] * siLU);
     }
 }
 
@@ -81,14 +81,17 @@ __global__ void swiglu_backward_kernel1(floatX *dinp, floatX *dgate,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N)
     {
+        float inp_i = (float)inp[i];
+        float gate_i = (float)gate[i];
+        float dout_i = (float)dout[i];
 
         // Calculate sigmoid and SiLU (Swish) activations
-        floatX sigmoid = 1.0f / (1.0f + expf(-inp[i]));
-        floatX siLU = inp[i] * sigmoid;
+        float sigmoid = 1.0f / (1.0f + expf(-inp_i));
+        float siLU = inp_i * sigmoid;
 
         // Perform gradient computations
-        dinp[i] = dout[i] * (sigmoid + siLU * ((floatX)1.0f - sigmoid)) * gate[i];
-        dgate[i] = dout[i] * siLU;
+        dinp[i] = (floatX)(dout_i * (sigmoid + siLU * (1.0f - sigmoid)) * gate_i);
+        dgate[i] = (floatX)(dout_i * siLU);
     }
 }
 
@@ -113,17 +116,17 @@ __global__ void swiglu_backward_kernel2(floatX *dinp, floatX *dgate,
         for (int k = 0; k < packed_inp.size; ++k)
         {
             // Compute the SiLU and sigmoid for each packed element
-            floatX xiW = (floatX)packed_inp[k];  // input
-            floatX xiV = (floatX)packed_gate[k]; // gate
-            floatX dxi = (floatX)packed_dout[k]; // dout
+            float xiW = (float)packed_inp[k];  // input
+            float xiV = (float)packed_gate[k]; // gate
+            float dxi = (float)packed_dout[k]; // dout
 
             // Calculate sigmoid and SiLU (Swish) activations
-            floatX sigmoid = 1.0f / (1.0f + expf(-xiW));
-            floatX siLU = xiW * sigmoid;
+            float sigmoid = 1.0f / (1.0f + expf(-xiW));
+            float siLU = xiW * sigmoid;
 
             // Gradient of SwiGLU w.r.t inp and gate
-            packed_dinp[k] = dxi * (sigmoid + siLU * ((floatX)1.0f - sigmoid)) * xiV;
-            packed_dgate[k] = dxi * siLU;
+            packed_dinp[k] = (floatX)(dxi * (sigmoid + siLU * (1.0f - sigmoid)) * xiV);
+            packed_dgate[k] = (floatX)(dxi * siLU);
         }
 
         // Store the gradients back to global memory

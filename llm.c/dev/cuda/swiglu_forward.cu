@@ -16,7 +16,7 @@ block_size  256 | time 0.1762 ms | bandwidth 214.21 GB/s
 block_size  512 | time 0.1750 ms | bandwidth 215.73 GB/s
 block_size 1024 | time 0.1939 ms | bandwidth 194.65 GB/s
 
-- version 2 uses co-operative groups to work with warp-level reductions with a warp_size of 32 threads, parallelizes over B,T,C
+- version 2 - uses 2 bfloat16 with the Packed128 data structure which helps in faster load/store operations, parallelizes over B,T,C
 ./swiglu_forward 2
 
 RESULTS:
@@ -55,7 +55,7 @@ void swiglu_forward_cpu(float *out, const float *inp, const float *gate, int N)
     {
         float xW = inp[i];
         float xV = gate[i];
-        out[i] = (xW / (1.0f + expf(-xW))) * xV;
+        out[i] = (floatX)((xW / (1.0f + expf(-xW))) * xV);
     }
 }
 
@@ -67,9 +67,9 @@ __global__ void swiglu_forward_kernel1(floatX *out, const floatX *inp, const flo
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N)
     {
-        floatX xiW = inp[i];
-        floatX xiV = gate[i];
-        out[i] = (xiW / (floatX)(1.0f + expf(-xiW))) * xiV;
+        float xiW = inp[i];
+        float xiV = gate[i];
+        out[i] = (floatX)((xiW / (1.0f + expf(-xiW))) * xiV);
     }
 }
 
@@ -90,9 +90,9 @@ __global__ void swiglu_forward_kernel2(floatX *out, const floatX *inp, const flo
 
         for (int k = 0; k < packed_inp.size; ++k)
         {
-            floatX xiW = (floatX)packed_inp[k];                        // Extract element from packed input
-            floatX xiV = (floatX)packed_gate[k];                       // Extract element from packed gate
-            packed_out[k] = (xiW / (floatX)(1.0f + expf(-xiW))) * xiV; // SwiGLU operation
+            float xiW = (float)packed_inp[k];                            // Extract element from packed input
+            float xiV = (float)packed_gate[k];                           // Extract element from packed gate
+            packed_out[k] = (floatX)((xiW / (1.0f + expf(-xiW))) * xiV); // SwiGLU operation
         }
 
         // Store the result back in memory (cached)
