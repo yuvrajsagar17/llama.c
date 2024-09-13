@@ -112,12 +112,3 @@ writing 305,260 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_train.bin
 
 The .bin files contain a short header (1024 bytes) and then a stream of tokens in uint16, indicating the token ids with the GPT-2 tokenizer. More datasets are available in `/dev/data`.
 
-## discussions
-
-Ways of organizing development:
-
-// TODOs: Should be added
-
-## license
-
-// Licensed under the Apache License
